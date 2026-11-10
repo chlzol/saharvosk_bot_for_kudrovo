@@ -1,0 +1,26 @@
+# Секретные токены и конфигурация
+.env
+
+# Виртуальное окружение
+.venv/
+venv/
+env/
+
+# Базы данных SQLite (бинарники не должны попадать в контекст агента)
+*.db
+*.db-wal
+*.db-shm
+*.sqlite3
+
+# Кэш Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Настройки IDE (PyCharm / VS Code)
+.idea/
+.vscode/
+
+# Логи и временные файлы
+*.log
+saharvosk_catalog.txt
