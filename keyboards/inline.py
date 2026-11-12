@@ -16,7 +16,7 @@ STEP_GROUP_TITLES = {
     "booking": "💅 Общие шаги онлайн-записи",
     "cats": "📂 Категории (Направления услуг)",
     "subcats": "🗂 Подкатегории и Зоны процедур",
-    "memos": "🔔 Памятки, Напоминания и Отзывы (NPS)"
+    "memos": "🔔 Напоминания и Отзывы (NPS)"
 }
 
 
@@ -53,7 +53,7 @@ def branch_route_kb(branch_id: str) -> InlineKeyboardMarkup:
     ])
 
 
-def post_booking_kb(appointment_id: int, branch_id: str, prep_memo_key: str, google_cal_url: str) -> InlineKeyboardMarkup:
+def post_booking_kb(appointment_id: int, branch_id: str, google_cal_url: str) -> InlineKeyboardMarkup:
     b = get_branches().get(branch_id, {})
     map_url = b.get("yandex_map_url", "https://yandex.ru/maps")
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -61,7 +61,6 @@ def post_booking_kb(appointment_id: int, branch_id: str, prep_memo_key: str, goo
             InlineKeyboardButton(text="📅 В Google Календарь", url=google_cal_url),
             InlineKeyboardButton(text="📥 В Apple / Смартфон (.ICS)", callback_data=f"cal_ics:{appointment_id}")
         ],
-        [InlineKeyboardButton(text="📋 Памятка по подготовке к визиту", callback_data=f"show_memo:{prep_memo_key}")],
         [InlineKeyboardButton(text="📍 Геометка студии в чат", callback_data=f"geo:{branch_id}")],
         [InlineKeyboardButton(text="🗺 Построить маршрут в Яндекс.Картах", url=map_url)]
     ])
@@ -316,7 +315,6 @@ def confirm_kb() -> InlineKeyboardMarkup:
 def appointment_manage_kb(
     appointment_id: int,
     branch_id: str | None = None,
-    prep_memo_key: str | None = None,
     google_cal_url: str | None = None
 ) -> InlineKeyboardMarkup:
     buttons = []
@@ -327,8 +325,6 @@ def appointment_manage_kb(
     cal_row.append(InlineKeyboardButton(text="📥 В Apple (.ICS)", callback_data=f"cal_ics:{appointment_id}"))
     buttons.append(cal_row)
 
-    if prep_memo_key:
-        buttons.append([InlineKeyboardButton(text="📋 Памятка по подготовке", callback_data=f"show_memo:{prep_memo_key}")])
     if branch_id:
         buttons.append([InlineKeyboardButton(text="📍 Как добраться (Геометка)", callback_data=f"geo:{branch_id}")])
 
@@ -388,9 +384,17 @@ def price_categories_kb(branch_id: str, categories: dict, page: int = 1, page_si
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
+_SHORT_BRANCH = {"prazhskaya": "pr", "leningradskaya": "ln"}
+
+
+def _short_branch(branch_id: str) -> str:
+    return _SHORT_BRANCH.get(branch_id, branch_id)
+
+
 def price_subcategories_kb(branch_id: str, main_cat_id: str, subcategories: dict) -> InlineKeyboardMarkup:
+    sb = _short_branch(branch_id)
     buttons = [
-        [InlineKeyboardButton(text=title, callback_data=f"pr_sub:{branch_id}:{main_cat_id}:{sub_id}:1")]
+        [InlineKeyboardButton(text=title, callback_data=f"ps:{sb}:{main_cat_id}:{sub_id}:1")]
         for sub_id, title in subcategories.items()
     ]
     buttons.append([InlineKeyboardButton(text="‹ К направлениям", callback_data=f"price_br:{branch_id}")])
@@ -398,14 +402,15 @@ def price_subcategories_kb(branch_id: str, main_cat_id: str, subcategories: dict
 
 
 def price_services_view_kb(branch_id: str, main_cat_id: str, subcat_id: str, page: int, total_pages: int) -> InlineKeyboardMarkup:
+    sb = _short_branch(branch_id)
     buttons = []
     if total_pages > 1:
         nav = []
         if page > 1:
-            nav.append(InlineKeyboardButton(text="‹", callback_data=f"pr_sub:{branch_id}:{main_cat_id}:{subcat_id}:{page - 1}"))
+            nav.append(InlineKeyboardButton(text="‹", callback_data=f"ps:{sb}:{main_cat_id}:{subcat_id}:{page - 1}"))
         nav.append(InlineKeyboardButton(text=f"{page} / {total_pages}", callback_data="ignore"))
         if page < total_pages:
-            nav.append(InlineKeyboardButton(text="›", callback_data=f"pr_sub:{branch_id}:{main_cat_id}:{subcat_id}:{page + 1}"))
+            nav.append(InlineKeyboardButton(text="›", callback_data=f"ps:{sb}:{main_cat_id}:{subcat_id}:{page + 1}"))
         buttons.append(nav)
 
     buttons.append([InlineKeyboardButton(text="✨ Записаться онлайн", callback_data="start_new_booking")])
@@ -507,6 +512,7 @@ def admin_step_actions_kb(step_key: str, has_photo: bool, group: str = "menu") -
 
 
 def admin_edit_text_kb(step_key: str, current_text: str) -> InlineKeyboardMarkup:
+    current_text = current_text or ""
     buttons = []
     if len(current_text.encode("utf-8")) <= 240:
         buttons.append([InlineKeyboardButton(text="⌨️ Вставить текущий текст в поле ввода", switch_inline_query_current_chat=current_text)])

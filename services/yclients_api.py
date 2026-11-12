@@ -143,13 +143,18 @@ async def _fetch_available_times_raw(
                 raw_slots = data if isinstance(data, list) else data.get("data", [])
 
                 slots = []
-                for item in raw_slots:
+                for item in (raw_slots or []):
                     t = item.get("time") if isinstance(item, dict) else str(item)
-                    if t:
-                        slots.append(":".join(t.split(":")[:2]))
+                    if t and ":" in t:
+                        parts = t.split(":")[:2]
+                        if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+                            slots.append(f"{int(parts[0]):02d}:{int(parts[1]):02d}")
 
                 now = now_msk()
-                if date.fromisoformat(date_str) == now.date():
+                target_date = date.fromisoformat(date_str)
+                if target_date < now.date():
+                    return []
+                if target_date == now.date():
                     min_dt = now + timedelta(minutes=30)
                     filtered = []
                     for s in slots:
@@ -217,7 +222,7 @@ async def check_slot_available(
             if resp.status in (400, 422):
                 resp_json = await resp.json()
                 meta = resp_json.get("meta", {})
-                err_msg = meta.get("message") if isinstance(meta, dict) else f"Время {visit_time} больше недоступно."
+                err_msg = (meta.get("message") if isinstance(meta, dict) else None) or f"Время {visit_time} больше недоступно."
                 updated_times = [t for t in (fresh_times or []) if t != visit_time]
                 return False, updated_times, err_msg
     except Exception as e:
@@ -242,7 +247,7 @@ async def is_yclients_record_active(branch_id: str, yclients_record_id: str | No
                 return False
             if resp.status == 200:
                 resp_json = await resp.json()
-                data = resp_json.get("data", {}) if isinstance(resp_json, dict) else {}
+                data = (resp_json.get("data") or {}) if isinstance(resp_json, dict) else {}
                 if data.get("deleted") is True:
                     return False
                 if data.get("attendance") == -1 or data.get("visit_attendance") == -1:
@@ -269,7 +274,7 @@ async def fetch_record_assigned_staff_id(branch_id: str, yclients_record_id: str
         async with session.get(url, headers=_get_headers()) as resp:
             if resp.status == 200:
                 resp_json = await resp.json()
-                data = resp_json.get("data", {}) if isinstance(resp_json, dict) else {}
+                data = (resp_json.get("data") or {}) if isinstance(resp_json, dict) else {}
                 staff_id = data.get("staff_id") or (data.get("staff", {}) or {}).get("id")
                 if staff_id:
                     return str(staff_id)
@@ -318,8 +323,11 @@ async def create_yclients_record(data: dict) -> tuple[str | None, str | None, st
             if resp.status in (200, 201) and resp_json.get("success"):
                 records = resp_json.get("data", [])
                 if records:
-                    rec_obj = records[0]
-                    rec_id = str(rec_obj.get("record_id"))
+                    rec_obj = records[0] if isinstance(records, list) else records
+                    raw_rec_id = rec_obj.get("record_id") or rec_obj.get("id") if isinstance(rec_obj, dict) else None
+                    if not raw_rec_id:
+                        return None, "Сервер расписания не вернул номер записи.", None
+                    rec_id = str(raw_rec_id)
                     assigned_staff = str(rec_obj.get("staff_id")) if rec_obj.get("staff_id") else None
                     if not assigned_staff and data["master_id"] == "any":
                         assigned_staff = await fetch_record_assigned_staff_id(data["branch_id"], rec_id)

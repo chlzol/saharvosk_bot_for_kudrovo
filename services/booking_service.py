@@ -1,6 +1,13 @@
 import calendar
 import importlib
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
+
+MSK_TZ = timezone(timedelta(hours=3))
+
+
+def now_msk() -> datetime:
+    """Возвращает текущее время по Санкт-Петербургу / Москве (UTC+3) без таймзоны."""
+    return datetime.now(MSK_TZ).replace(tzinfo=None)
 
 try:
     from services import booking_data
@@ -544,7 +551,7 @@ EXCLUDED_MEN_MASSAGE_KEYWORDS = [
 
 STANDALONE_ADDON_KEYWORDS = [
     "с последующим", "дизайн 1 ногтя", "сложный дизайн", "простой дизайн",
-    "врасший ноготь", "в 4 руки", "в 6 рук"
+    "вросший ноготь", "в 4 руки", "в 6 рук"
 ]
 
 
@@ -845,14 +852,6 @@ def get_branches() -> dict:
     return result
 
 
-def get_memo_keys_for_appointment(cat_id: str, service_title: str) -> tuple[str, str]:
-    title_low = (service_title or "").lower()
-    if "лазер" in title_low or "shr" in title_low:
-        return "memo_prep_laser", "memo_after_laser"
-    if any(k in title_low for k in ("шугаринг", "сахар", "полимер", "воск", "ваксинг", "skins", "депиляц")) or cat_id == "hair_removal":
-        return "memo_prep_depil", "memo_after_depil"
-    return "memo_prep_general", "memo_after_general"
-
 
 def get_categories_by_branch(branch_id: str) -> dict:
     counts = {k: 0 for k in MAIN_CATEGORIES_CONFIG}
@@ -1145,14 +1144,14 @@ def generate_catalog_report() -> str:
 
 
 def get_allowed_months() -> list[tuple[int, int]]:
-    today = date.today()
+    today = now_msk().date()
     current_ym = (today.year, today.month)
     next_ym = (today.year + 1, 1) if today.month == 12 else (today.year, today.month + 1)
     return [current_ym, next_ym]
 
 
 def get_available_dates_in_month(year: int, month: int, api_dates: list[str] | None = None) -> list[date]:
-    today = date.today()
+    today = now_msk().date()
     _, last_day = calendar.monthrange(year, month)
     api_dates_set = set(api_dates) if api_dates is not None else None
     available = []
@@ -1174,7 +1173,7 @@ def get_available_dates_in_month(year: int, month: int, api_dates: list[str] | N
 def get_available_times(date_str: str, booked_slots: list[str] | None = None) -> list[str]:
     booked = set(booked_slots or [])
     target_date = date.fromisoformat(date_str)
-    now = datetime.now()
+    now = now_msk()
 
     if target_date < now.date():
         return []

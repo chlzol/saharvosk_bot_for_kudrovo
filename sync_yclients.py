@@ -74,17 +74,17 @@ async def fetch_staff(session: aiohttp.ClientSession, company_id: int) -> list[d
     return []
 
 
-async def fetch_services(session: aiohttp.ClientSession, company_id: int, staff_id: str | None = None) -> dict:
+async def fetch_services(session: aiohttp.ClientSession, company_id: int, staff_id: str | None = None) -> dict | None:
     url = f"{BASE_URL}/book_services/{company_id}"
     params = {"staff_id": staff_id} if staff_id else {}
     try:
         async with session.get(url, headers=_get_headers(), params=params) as resp:
             if resp.status == 200:
-                return (await resp.json()).get("data", {})
+                return (await resp.json()).get("data") or {}
             logging.error(f"Ошибка загрузки услуг компании {company_id}: {await resp.text()}")
     except Exception as e:
         logging.error(f"Сетевая ошибка при загрузке услуг {company_id}: {e}")
-    return {}
+    return None
 
 
 async def run_yclients_sync() -> dict:
@@ -141,6 +141,8 @@ async def run_yclients_sync() -> dict:
                         masters_result[s_id]["branches"].append(branch_key)
 
             srv_data = await fetch_services(session, comp_id)
+            if srv_data is None:
+                raise RuntimeError(f"Не удалось загрузить услуги филиала {branch_key} (company_id={comp_id})")
             services_list = srv_data.get("services", []) if isinstance(srv_data, dict) else srv_data
             categories_list = srv_data.get("category", []) if isinstance(srv_data, dict) else []
 
@@ -154,7 +156,7 @@ async def run_yclients_sync() -> dict:
             async def _fetch_master_services(st_id: str):
                 async with semaphore:
                     m_data = await fetch_services(session, comp_id, staff_id=st_id)
-                    m_srvs = m_data.get("services", []) if isinstance(m_data, dict) else m_data
+                    m_srvs = ((m_data.get("services", []) if isinstance(m_data, dict) else m_data) if m_data is not None else []) or []
                     res_items = []
                     for x in m_srvs:
                         if isinstance(x, dict) and "id" in x:
@@ -235,6 +237,9 @@ async def run_yclients_sync() -> dict:
 
     for m in masters_result.values():
         m["cats"] = list(categories_result.keys())
+
+    if not services_result or not masters_result:
+        raise RuntimeError("Пустой результат синхронизации YCLIENTS — каталог booking_data.py не перезаписан.")
 
     output_path = "services/booking_data.py"
     with open(output_path, "w", encoding="utf-8") as f:

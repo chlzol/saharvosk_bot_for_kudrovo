@@ -26,13 +26,14 @@ from services.scheduler import (
     send_aftercare_and_nps,
     send_repeat_reminder
 )
-from handlers.admin import notify_admins, send_to_archive_group
+from handlers.admin import check_admin, notify_admins, send_to_archive_group, escape_md
 from handlers.common import ensure_user_consent
 from keyboards.default import get_main_keyboard, get_phone_keyboard, MAIN_MENU_BUTTONS
 from keyboards import inline as ikb
 from database import db
 
 router = Router()
+_pending_bookings: set[int] = set()
 
 
 def _resolve_service_list_step_key(cat_id: str, subcat_id: str, sub2_id: str | None = None) -> str:
@@ -61,7 +62,9 @@ def _is_valid_human_name(name: str | None) -> bool:
     if not name:
         return False
     clean = name.strip()
-    return bool(re.match(r"^[А-Яа-яЁёA-Za-z\-\s]{2,35}$", clean))
+    if not re.match(r"^[А-Яа-яЁёA-Za-z\-\s]{2,35}$", clean):
+        return False
+    return sum(1 for ch in clean if ch.isalpha()) >= 2
 
 
 def _get_name_prompt_kb(suggested_name: str | None) -> ReplyKeyboardMarkup:
@@ -87,7 +90,20 @@ async def _safe_edit_message(call: CallbackQuery, text: str, reply_markup=None):
 
     try:
         await msg.edit_text(text, reply_markup=reply_markup, parse_mode="Markdown", disable_web_page_preview=True)
-    except TelegramBadRequest:
+    except TelegramBadRequest as e:
+        err_lower = str(e).lower()
+        if "message is not modified" in err_lower:
+            return
+        if "message can't be edited" in err_lower or "message to edit not found" in err_lower:
+            try:
+                await msg.answer(text, reply_markup=reply_markup, parse_mode="Markdown", disable_web_page_preview=True)
+                return
+            except TelegramBadRequest:
+                try:
+                    await msg.answer(text, reply_markup=reply_markup, disable_web_page_preview=True)
+                    return
+                except Exception:
+                    pass
         try:
             await msg.edit_text(text, reply_markup=reply_markup, disable_web_page_preview=True)
         except Exception:
@@ -125,6 +141,10 @@ async def _resolve_masters_for_services(branch_id: str, service_ids: list[str]) 
 
 @router.message(Command("test_remind"))
 async def cmd_test_remind(message: Message):
+    if not await check_admin(message.from_user.id):
+        await message.answer("⛔️ Команда доступна только администраторам студии **Sahar&Vosk**.", parse_mode="Markdown")
+        return
+
     appointments = await db.get_user_active_appointments(message.from_user.id)
     if not appointments:
         await message.answer("⚠️ У вас нет активных записей. Сначала создайте любую запись, а затем вызовите `/test_remind`.", parse_mode="Markdown")
@@ -146,7 +166,7 @@ async def cmd_test_remind(message: Message):
 async def send_calendar_ics_file(call: CallbackQuery):
     app_id = int(call.data.split(":")[1])
     app = await db.get_appointment_by_id(app_id)
-    if not app:
+    if not app or app["telegram_id"] != call.from_user.id:
         await call.answer("Запись не найдена.", show_alert=True)
         return
 
@@ -288,11 +308,11 @@ async def process_negative_nps_feedback(message: Message, state: FSMContext):
         alert_text = (
             f"🚨 **Контроль качества · Sahar&Vosk: {stars_str} ({rating}/5)**\n"
             f"────────────────────\n"
-            f"📍 **Студия:** {branch_title}\n"
-            f"👤 **Клиент:** {app['client_name']} (`{app['phone']}`)\n"
-            f"✨ **Услуга:** {app['service_title']} (Запись №{app_id})\n"
-            f"👩‍⚕️ **Специалист:** {app['master_name']}\n\n"
-            f"💬 **Комментарий клиента:**\n{feedback_text}"
+            f"📍 **Студия:** {escape_md(branch_title)}\n"
+            f"👤 **Клиент:** {escape_md(app['client_name'])} (`{app['phone']}`)\n"
+            f"✨ **Услуга:** {escape_md(app['service_title'])} (Запись №{app_id})\n"
+            f"👩‍⚕️ **Специалист:** {escape_md(app['master_name'])}\n\n"
+            f"💬 **Комментарий клиента:**\n{escape_md(feedback_text)}"
         )
         await notify_admins(
             message.bot,
@@ -315,7 +335,12 @@ async def process_negative_nps_feedback(message: Message, state: FSMContext):
             client_name=app["client_name"],
             client_id=message.from_user.id,
             username=message.from_user.username,
-            text=f"🚨 [ОТЗЫВ {rating}/5 ⭐️ по записи №{app_id} ({app['master_name']})]: {feedback_text}"
+            text=(
+                f"🚨 [КОНТРОЛЬ КАЧЕСТВА] Оценка {rating}/5 ⭐️ · "
+                f"Запись №{app_id} ({app['service_title']}, мастер: {app['master_name']}):\n"
+                f"{feedback_text}"
+            ),
+            photo_id=message.photo[-1].file_id if message.photo else None
         )
 
     await db.render_step(
@@ -402,10 +427,12 @@ async def show_price_subcategories(call: CallbackQuery):
     await call.answer()
 
 
-@router.callback_query(F.data.startswith("pr_sub:"))
+@router.callback_query(F.data.startswith("pr_sub:") | F.data.startswith("ps:"))
 async def show_category_services_price(call: CallbackQuery):
     parts = call.data.split(":")
-    _, branch_id, main_cat_id, subcat_id, page_str = parts[:5]
+    _, raw_branch, main_cat_id, subcat_id, page_str = parts[:5]
+    branch_id = {"pr": "prazhskaya", "ln": "leningradskaya"}.get(raw_branch, raw_branch)
+    sb = ikb._short_branch(branch_id)
     sub2_id = parts[5] if len(parts) > 5 else None
     page = int(page_str)
 
@@ -415,7 +442,7 @@ async def show_category_services_price(call: CallbackQuery):
             branch_title = bs.get_branches().get(branch_id, {}).get("title", "")
             subcat_title = bs.get_subcategory_title(main_cat_id, subcat_id)
             buttons = [
-                [InlineKeyboardButton(text=title, callback_data=f"pr_sub:{branch_id}:{main_cat_id}:{subcat_id}:1:{s2_id}")]
+                [InlineKeyboardButton(text=title, callback_data=f"ps:{sb}:{main_cat_id}:{subcat_id}:1:{s2_id}")]
                 for s2_id, title in sub2_options.items()
             ]
             buttons.append([InlineKeyboardButton(text="‹ Назад к категориям", callback_data=f"pr_cat:{branch_id}:{main_cat_id}")])
@@ -453,13 +480,13 @@ async def show_category_services_price(call: CallbackQuery):
         if total_pages > 1:
             nav = []
             if page > 1:
-                nav.append(InlineKeyboardButton(text="‹", callback_data=f"pr_sub:{branch_id}:{main_cat_id}:{subcat_id}:{page - 1}:{sub2_id}"))
+                nav.append(InlineKeyboardButton(text="‹", callback_data=f"ps:{sb}:{main_cat_id}:{subcat_id}:{page - 1}:{sub2_id}"))
             nav.append(InlineKeyboardButton(text=f"{page} / {total_pages}", callback_data="ignore"))
             if page < total_pages:
-                nav.append(InlineKeyboardButton(text="›", callback_data=f"pr_sub:{branch_id}:{main_cat_id}:{subcat_id}:{page + 1}:{sub2_id}"))
+                nav.append(InlineKeyboardButton(text="›", callback_data=f"ps:{sb}:{main_cat_id}:{subcat_id}:{page + 1}:{sub2_id}"))
             buttons.append(nav)
         buttons.append([InlineKeyboardButton(text="✨ Записаться онлайн", callback_data="start_new_booking")])
-        buttons.append([InlineKeyboardButton(text="‹ Назад к разделам", callback_data=f"pr_sub:{branch_id}:{main_cat_id}:{subcat_id}:1")])
+        buttons.append([InlineKeyboardButton(text="‹ Назад к разделам", callback_data=f"ps:{sb}:{main_cat_id}:{subcat_id}:1")])
         kb = InlineKeyboardMarkup(inline_keyboard=buttons)
     else:
         kb = ikb.price_services_view_kb(branch_id, main_cat_id, subcat_id, page, total_pages)
@@ -501,7 +528,6 @@ async def show_my_appointments(message: Message, state: FSMContext):
     for app in appointments:
         formatted_date = date.fromisoformat(app["visit_date"]).strftime("%d.%m.%Y")
         status_badge = "✓ Подтверждена" if app.get("confirmed") else "⏳ Ожидает визита"
-        prep_key, _ = bs.get_memo_keys_for_appointment(app.get("cat_id", ""), app.get("service_title", ""))
 
         branch = bs.get_branches().get(app["branch_id"], {})
         address = branch.get("address", app["branch_title"])
@@ -520,7 +546,6 @@ async def show_my_appointments(message: Message, state: FSMContext):
         kb = ikb.appointment_manage_kb(
             app["id"],
             branch_id=app["branch_id"],
-            prep_memo_key=prep_key,
             google_cal_url=google_url
         )
         await db.render_step(
@@ -542,6 +567,13 @@ async def show_my_appointments(message: Message, state: FSMContext):
 async def confirm_user_visit(call: CallbackQuery):
     app_id = int(call.data.split(":")[1])
     app = await db.get_appointment_by_id(app_id)
+    if not app:
+        await call.answer("Запись не найдена или уже была отменена.", show_alert=True)
+        return
+    if app["telegram_id"] != call.from_user.id:
+        await call.answer("⛔️ Вы не можете подтвердить чужую запись.", show_alert=True)
+        return
+
     success = await db.confirm_appointment_visit(app_id, call.from_user.id)
     if success:
         await _safe_edit_message(
@@ -550,13 +582,12 @@ async def confirm_user_visit(call: CallbackQuery):
             "────────────────────\n"
             "С нетерпением ждём вас в студии **Sahar&Vosk** 🤍"
         )
-        if app:
-            await notify_admins(
-                call.bot,
-                f"✓ **Клиент подтвердил визит · Sahar&Vosk**\n"
-                f"Запись №{app_id} — {app['client_name']} (`{app['phone']}`)\n"
-                f"📍 {app['branch_title']} · {app['visit_date']} в {app['visit_time']}"
-            )
+        await notify_admins(
+            call.bot,
+            f"✓ **Клиент подтвердил визит · Sahar&Vosk**\n"
+            f"Запись №{app_id} — {escape_md(app['client_name'])} (`{app['phone']}`)\n"
+            f"📍 {escape_md(app['branch_title'])} · {app['visit_date']} в {app['visit_time']}"
+        )
         await call.answer("Визит подтверждён!")
     else:
         await call.answer("Запись не найдена или уже была отменена.", show_alert=True)
@@ -566,22 +597,28 @@ async def confirm_user_visit(call: CallbackQuery):
 async def cancel_user_appointment(call: CallbackQuery):
     app_id = int(call.data.split(":")[1])
     app = await db.get_appointment_by_id(app_id)
+    if not app:
+        await call.answer("Запись уже была отменена или не найдена.", show_alert=True)
+        return
+    if app["telegram_id"] != call.from_user.id:
+        await call.answer("⛔️ Вы не можете отменить чужую запись.", show_alert=True)
+        return
+
     success = await db.cancel_appointment(app_id, call.from_user.id)
     if success:
         remove_appointment_reminders(app_id)
-        if app:
-            await yclients_api.delete_yclients_record(app["branch_id"], app.get("yclients_record_id"))
-            formatted_date = date.fromisoformat(app["visit_date"]).strftime("%d.%m.%Y")
-            await notify_admins(
-                call.bot,
-                f"✕ **Отмена записи клиентом (№{app_id}) · Sahar&Vosk**\n"
-                f"────────────────────\n"
-                f"📍 Студия: {app['branch_title']}\n"
-                f"👤 Клиент: {app['client_name']} (`{app['phone']}`)\n"
-                f"✨ Услуги: {app['service_title']}\n"
-                f"👩‍⚕️ Специалист: {app['master_name']}\n"
-                f"🗓 Дата и время: {formatted_date} в {app['visit_time']}"
-            )
+        await yclients_api.delete_yclients_record(app["branch_id"], app.get("yclients_record_id"))
+        formatted_date = date.fromisoformat(app["visit_date"]).strftime("%d.%m.%Y")
+        await notify_admins(
+            call.bot,
+            f"✕ **Отмена записи клиентом (№{app_id}) · Sahar&Vosk**\n"
+            f"────────────────────\n"
+            f"📍 Студия: {escape_md(app['branch_title'])}\n"
+            f"👤 Клиент: {escape_md(app['client_name'])} (`{app['phone']}`)\n"
+            f"✨ Услуги: {escape_md(app['service_title'])}\n"
+            f"👩‍⚕️ Специалист: {escape_md(app['master_name'])}\n"
+            f"🗓 Дата и время: {formatted_date} в {app['visit_time']}"
+        )
         await _safe_edit_message(
             call,
             f"✕ **Запись №{app_id} отменена.**\n"
@@ -597,7 +634,7 @@ async def reschedule_user_appointment(call: CallbackQuery, state: FSMContext):
     app_id = int(call.data.split(":")[1])
     app = await db.get_appointment_by_id(app_id)
 
-    if not app or app["status"] != "active":
+    if not app or app["telegram_id"] != call.from_user.id or app["status"] != "active":
         await call.answer("Запись не найдена или уже отменена.", show_alert=True)
         return
 
@@ -1116,6 +1153,12 @@ async def cart_delete_item(call: CallbackQuery, state: FSMContext):
 
     del_id = call.data.split(":")[1]
     selected_ids = [sid for sid in data.get("selected_services", []) if str(sid) != str(del_id)]
+    if selected_ids and all(bs.is_standalone_addon_service(bs.get_service_by_id(sid) or {}) for sid in selected_ids):
+        await call.answer(
+            "⚠️ Доп. услуга выполняется только вместе с основной процедурой. Сначала удалите доп. услугу или очистите выбор.",
+            show_alert=True
+        )
+        return
     await state.update_data(
         selected_services=selected_ids,
         service_id=selected_ids[0] if selected_ids else ""
@@ -1228,11 +1271,17 @@ async def select_master(call: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data.startswith("cal:"))
 async def switch_calendar_month(call: CallbackQuery, state: FSMContext):
-    data = await state.get_data()
+    data = await _require_state(call, state, "branch_id", "master_id")
+    if not data:
+        return
     api_dates = data.get("api_available_dates")
     _, year_str, month_str = call.data.split(":")
     year, month = int(year_str), int(month_str)
-    await call.message.edit_reply_markup(reply_markup=ikb.calendar_kb(year, month, api_dates=api_dates))
+    try:
+        await call.message.edit_reply_markup(reply_markup=ikb.calendar_kb(year, month, api_dates=api_dates))
+    except TelegramBadRequest as e:
+        if "message is not modified" not in str(e).lower():
+            raise
     await call.answer()
 
 
@@ -1332,7 +1381,7 @@ async def select_time(call: CallbackQuery, state: FSMContext):
             await call.message.delete()
         except Exception:
             pass
-        await show_confirmation(call.message, state)
+        await _verify_slot_and_confirm(call.message, state)
         await call.answer()
         return
 
@@ -1382,8 +1431,10 @@ async def process_phone(message: Message, state: FSMContext):
 )
 async def process_client_name(message: Message, state: FSMContext):
     name = (message.text or "").strip()
-    if len(name) < 2 or len(name) > 40:
-        await message.answer("⚠️ Пожалуйста, введите корректное имя (от 2 букв).")
+    if not _is_valid_human_name(name):
+        await message.answer(
+            "⚠️ Пожалуйста, введите корректное имя (от 2 до 35 букв, без цифр и спецсимволов)."
+        )
         return
 
     await db.set_user_real_name(message.from_user.id, name)
@@ -1407,8 +1458,8 @@ async def _verify_slot_and_confirm(message: Message, state: FSMContext):
         date_str=data["visit_date"],
         visit_time=data["visit_time"]
     )
-    booked_local = await db.get_booked_slots(data["branch_id"], data["master_id"], data["visit_date"])
-    if not is_free or data["visit_time"] in booked_local:
+    booked_local = [] if yclients_api.USE_YCLIENTS_API else await db.get_booked_slots(data["branch_id"], data["master_id"], data["visit_date"])
+    if not is_free or (booked_local and data["visit_time"] in booked_local):
         await message.answer(
             f"⚠️ **К сожалению, пока вы вводили контакты, время {data['visit_time']} уже забронировали.**\n"
             "Пожалуйста, выберите другое удобное время:",
@@ -1488,167 +1539,174 @@ async def finalize_booking(call: CallbackQuery, state: FSMContext):
         return
 
     if action == "yes":
-        data = await _require_state(call, state, "branch_id", "master_id", "visit_date", "visit_time")
-        if not data:
+        uid = call.from_user.id
+        if uid in _pending_bookings:
+            await call.answer("⏳ Оформляем запись, пожалуйста подождите...")
             return
 
-        branch = bs.get_branches().get(data["branch_id"], {})
-        selected_ids = data.get("selected_services") or ([data["service_id"]] if data.get("service_id") else [])
-        summary = bs.get_cart_summary(selected_ids)
-        master_id = data["master_id"]
-        master_name = bs.get_master_name(master_id)
-        formatted_date = date.fromisoformat(data["visit_date"]).strftime("%d.%m.%Y")
+        _pending_bookings.add(uid)
+        try:
+            data = await _require_state(call, state, "branch_id", "master_id", "visit_date", "visit_time", "client_name", "phone")
+            if not data:
+                return
 
-        is_free, fresh_times, slot_err = await yclients_api.check_slot_available(
-            branch_id=data["branch_id"],
-            master_id=master_id,
-            service_ids=selected_ids,
-            date_str=data["visit_date"],
-            visit_time=data["visit_time"]
-        )
-        booked_local = await db.get_booked_slots(data["branch_id"], master_id, data["visit_date"])
+            branch = bs.get_branches().get(data["branch_id"], {})
+            selected_ids = data.get("selected_services") or ([data["service_id"]] if data.get("service_id") else [])
+            summary = bs.get_cart_summary(selected_ids)
+            master_id = data["master_id"]
+            master_name = bs.get_master_name(master_id)
+            formatted_date = date.fromisoformat(data["visit_date"]).strftime("%d.%m.%Y")
 
-        if not is_free or data["visit_time"] in booked_local:
-            await call.answer(
-                f"⚠️ Пока вы подтверждали запись, время {data['visit_time']} уже заняли! Выберите другое свободное окно.",
-                show_alert=True
-            )
-            if not fresh_times and not yclients_api.USE_YCLIENTS_API:
-                fresh_times = bs.get_available_times(data["visit_date"], booked_slots=booked_local)
-
-            if fresh_times:
-                await state.set_state(BookingState.choosing_time)
-                await db.render_step(
-                    call,
-                    "step_6_time",
-                    reply_markup=ikb.times_kb(fresh_times),
-                    formatted_date=formatted_date
-                )
-            else:
-                await state.set_state(BookingState.choosing_date)
-                today = db.now_msk().date()
-                await db.render_step(
-                    call,
-                    "step_5_date",
-                    reply_markup=ikb.calendar_kb(today.year, today.month, api_dates=data.get("api_available_dates")),
-                    master_name=master_name
-                )
-            return
-
-        yclients_rec_id, err_msg, assigned_staff_id = await yclients_api.create_yclients_record({
-            "branch_id": data["branch_id"],
-            "service_ids": selected_ids,
-            "master_id": master_id,
-            "visit_date": data["visit_date"],
-            "visit_time": data["visit_time"],
-            "phone": data["phone"],
-            "client_name": data["client_name"]
-        })
-
-        if not yclients_rec_id:
-            await call.answer(
-                f"⚠️ Не удалось забронировать {data['visit_time']}: {err_msg or 'время уже занято'}. Выберите другой слот.",
-                show_alert=True
-            )
-            fresh_times = await yclients_api.fetch_available_times(
-                data["branch_id"], master_id, selected_ids, data["visit_date"]
-            )
-            if fresh_times:
-                await state.set_state(BookingState.choosing_time)
-                await db.render_step(
-                    call,
-                    "step_6_time",
-                    reply_markup=ikb.times_kb(fresh_times),
-                    formatted_date=formatted_date
-                )
-            return
-
-        if master_id == "any" and assigned_staff_id:
-            master_id = assigned_staff_id
-            master_name = bs.get_master_name(assigned_staff_id)
-
-        old_app_id = data.get("reschedule_app_id")
-        if old_app_id:
-            old_app = await db.get_appointment_by_id(old_app_id)
-            if old_app and old_app["status"] == "active":
-                await db.cancel_appointment(old_app_id, call.from_user.id)
-                remove_appointment_reminders(old_app_id)
-                await yclients_api.delete_yclients_record(old_app["branch_id"], old_app.get("yclients_record_id"))
-
-        appointment_id = await db.create_appointment({
-            "telegram_id": call.from_user.id,
-            "client_name": data["client_name"],
-            "phone": data["phone"],
-            "branch_id": data["branch_id"],
-            "branch_title": branch.get("title", data["branch_id"]),
-            "cat_id": data.get("cat_id", "other"),
-            "service_id": ",".join(str(x) for x in selected_ids),
-            "service_title": summary["titles_inline"],
-            "price": summary["total_price_num"],
-            "duration": summary["total_duration"],
-            "master_id": master_id,
-            "master_name": master_name,
-            "visit_date": data["visit_date"],
-            "visit_time": data["visit_time"],
-            "yclients_record_id": yclients_rec_id
-        })
-
-        await schedule_appointment_reminders(call.bot, appointment_id)
-
-        user_link = f"@{call.from_user.username}" if call.from_user.username else "без username"
-        crm_badge = f"(YCLIENTS #{yclients_rec_id})" if yclients_rec_id and yclients_rec_id != "mock_record_id" else ""
-        header_title = f"↺ **Перенос визита (новая №{appointment_id}) · Sahar&Vosk**" if old_app_id else f"✨ **Новое бронирование №{appointment_id} · Sahar&Vosk**"
-
-        await notify_admins(
-            call.bot,
-            f"{header_title} {crm_badge}\n"
-            f"────────────────────\n"
-            f"📍 **Студия:** {branch.get('title', data['branch_id'])}\n"
-            f"👤 **Клиент:** {data['client_name']} ({user_link})\n"
-            f"📞 **Телефон:** `{data['phone']}`\n"
-            f"✨ **Услуги ({summary['count']}):** {summary['titles_inline']} ({summary['total_price']})\n"
-            f"👩‍⚕️ **Специалист:** {master_name}\n"
-            f"🗓 **Дата и время:** {formatted_date} в **{data['visit_time']}**"
-        )
-
-        prep_memo_key, _ = bs.get_memo_keys_for_appointment(data.get("cat_id", ""), summary["titles_inline"])
-        address = branch.get("address", "г. Кудрово")
-
-        google_cal_url = ch.generate_google_calendar_url(
-            title=f"Sahar&Vosk — {summary['titles_inline']}",
-            visit_date=data["visit_date"],
-            visit_time=data["visit_time"],
-            duration_min=summary["total_duration"],
-            location=address,
-            description=f"Специалист: {master_name}\nСтудия: Sahar&Vosk · {branch.get('title', data['branch_id'])}\nАдрес: {address}\nТелефон: +7 (812) 988-98-53"
-        )
-
-        await state.clear()
-        await db.render_step(
-            call,
-            "step_success",
-            reply_markup=ikb.post_booking_kb(
-                appointment_id=appointment_id,
+            is_free, fresh_times, slot_err = await yclients_api.check_slot_available(
                 branch_id=data["branch_id"],
-                prep_memo_key=prep_memo_key,
-                google_cal_url=google_cal_url
-            ),
-            appointment_id=appointment_id,
-            address=address,
-            service_title=summary["titles_inline"],
-            price=summary["total_price"],
-            master_name=master_name,
-            formatted_date=formatted_date,
-            visit_time=data["visit_time"]
-        )
+                master_id=master_id,
+                service_ids=selected_ids,
+                date_str=data["visit_date"],
+                visit_time=data["visit_time"]
+            )
+            booked_local = [] if yclients_api.USE_YCLIENTS_API else await db.get_booked_slots(data["branch_id"], master_id, data["visit_date"])
 
-        await db.render_step_to_chat(
-            call.bot,
-            chat_id=call.from_user.id,
-            step_key=prep_memo_key,
-            service_title=summary["titles_inline"],
-            formatted_date=formatted_date,
-            visit_time=data["visit_time"],
-            branch_title=branch.get("title", data["branch_id"])
-        )
-        await call.answer("Бронирование подтверждено ✨")
+            if not is_free or (booked_local and data["visit_time"] in booked_local):
+                await call.answer(
+                    f"⚠️ Пока вы подтверждали запись, время {data['visit_time']} уже заняли! Выберите другое свободное окно."[:200],
+                    show_alert=True
+                )
+                if not fresh_times and not yclients_api.USE_YCLIENTS_API:
+                    fresh_times = bs.get_available_times(data["visit_date"], booked_slots=booked_local)
+
+                if fresh_times:
+                    await state.set_state(BookingState.choosing_time)
+                    await db.render_step(
+                        call,
+                        "step_6_time",
+                        reply_markup=ikb.times_kb(fresh_times),
+                        formatted_date=formatted_date
+                    )
+                else:
+                    await state.set_state(BookingState.choosing_date)
+                    today = db.now_msk().date()
+                    await db.render_step(
+                        call,
+                        "step_5_date",
+                        reply_markup=ikb.calendar_kb(today.year, today.month, api_dates=data.get("api_available_dates")),
+                        master_name=master_name
+                    )
+                return
+
+            yclients_rec_id, err_msg, assigned_staff_id = await yclients_api.create_yclients_record({
+                "branch_id": data["branch_id"],
+                "service_ids": selected_ids,
+                "master_id": master_id,
+                "visit_date": data["visit_date"],
+                "visit_time": data["visit_time"],
+                "phone": data["phone"],
+                "client_name": data["client_name"]
+            })
+
+            if not yclients_rec_id:
+                await call.answer(
+                    f"⚠️ Не удалось забронировать {data['visit_time']}: {err_msg or 'время уже занято'}. Выберите другой слот."[:200],
+                    show_alert=True
+                )
+                fresh_times = await yclients_api.fetch_available_times(
+                    data["branch_id"], master_id, selected_ids, data["visit_date"]
+                )
+                if fresh_times:
+                    await state.set_state(BookingState.choosing_time)
+                    await db.render_step(
+                        call,
+                        "step_6_time",
+                        reply_markup=ikb.times_kb(fresh_times),
+                        formatted_date=formatted_date
+                    )
+                else:
+                    await state.set_state(BookingState.choosing_date)
+                    today = db.now_msk().date()
+                    await db.render_step(
+                        call,
+                        "step_5_date",
+                        reply_markup=ikb.calendar_kb(today.year, today.month, api_dates=data.get("api_available_dates")),
+                        master_name=master_name
+                    )
+                return
+
+            if master_id == "any" and assigned_staff_id:
+                master_id = assigned_staff_id
+                master_name = bs.get_master_name(assigned_staff_id)
+
+            old_app_id = data.get("reschedule_app_id")
+            if old_app_id:
+                old_app = await db.get_appointment_by_id(old_app_id)
+                if old_app and old_app["status"] == "active":
+                    await db.cancel_appointment(old_app_id, uid)
+                    remove_appointment_reminders(old_app_id)
+                    await yclients_api.delete_yclients_record(old_app["branch_id"], old_app.get("yclients_record_id"))
+
+            appointment_id = await db.create_appointment({
+                "telegram_id": uid,
+                "client_name": data["client_name"],
+                "phone": data["phone"],
+                "branch_id": data["branch_id"],
+                "branch_title": branch.get("title", data["branch_id"]),
+                "cat_id": data.get("cat_id", "other"),
+                "service_id": ",".join(str(x) for x in selected_ids),
+                "service_title": summary["titles_inline"],
+                "price": summary["total_price_num"],
+                "duration": summary["total_duration"],
+                "master_id": master_id,
+                "master_name": master_name,
+                "visit_date": data["visit_date"],
+                "visit_time": data["visit_time"],
+                "yclients_record_id": yclients_rec_id
+            })
+
+            await schedule_appointment_reminders(call.bot, appointment_id)
+
+            user_link = f"@{escape_md(call.from_user.username)}" if call.from_user.username else "без username"
+            crm_badge = f"(YCLIENTS #{yclients_rec_id})" if yclients_rec_id and yclients_rec_id != "mock_record_id" else ""
+            header_title = f"↺ **Перенос визита (новая №{appointment_id}) · Sahar&Vosk**" if old_app_id else f"✨ **Новое бронирование №{appointment_id} · Sahar&Vosk**"
+
+            await notify_admins(
+                call.bot,
+                f"{header_title} {crm_badge}\n"
+                f"────────────────────\n"
+                f"📍 **Студия:** {escape_md(branch.get('title', data['branch_id']))}\n"
+                f"👤 **Клиент:** {escape_md(data['client_name'])} ({user_link})\n"
+                f"📞 **Телефон:** `{data['phone']}`\n"
+                f"✨ **Услуги ({summary['count']}):** {escape_md(summary['titles_inline'])} ({summary['total_price']})\n"
+                f"👩‍⚕️ **Специалист:** {escape_md(master_name)}\n"
+                f"🗓 **Дата и время:** {formatted_date} в **{data['visit_time']}**"
+            )
+
+            address = branch.get("address", "г. Кудрово")
+
+            google_cal_url = ch.generate_google_calendar_url(
+                title=f"Sahar&Vosk — {summary['titles_inline']}",
+                visit_date=data["visit_date"],
+                visit_time=data["visit_time"],
+                duration_min=summary["total_duration"],
+                location=address,
+                description=f"Специалист: {master_name}\nСтудия: Sahar&Vosk · {branch.get('title', data['branch_id'])}\nАдрес: {address}\nТелефон: +7 (812) 988-98-53"
+            )
+
+            await state.clear()
+            await db.render_step(
+                call,
+                "step_success",
+                reply_markup=ikb.post_booking_kb(
+                    appointment_id=appointment_id,
+                    branch_id=data["branch_id"],
+                    google_cal_url=google_cal_url
+                ),
+                appointment_id=appointment_id,
+                address=address,
+                service_title=summary["titles_inline"],
+                price=summary["total_price"],
+                master_name=master_name,
+                formatted_date=formatted_date,
+                visit_time=data["visit_time"]
+            )
+
+            await call.answer("Бронирование подтверждено ✨")
+        finally:
+            _pending_bookings.discard(uid)

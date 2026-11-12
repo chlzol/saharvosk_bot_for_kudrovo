@@ -2,7 +2,6 @@ from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery, ReplyKeyboardRemove, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
-from datetime import date
 
 from states.booking import SupportState
 from keyboards.default import get_main_keyboard, get_client_support_kb, MAIN_MENU_BUTTONS
@@ -12,7 +11,8 @@ from handlers.admin import (
     check_admin,
     notify_admins,
     send_to_archive_group,
-    open_client_chat_for_admin
+    open_client_chat_for_admin,
+    escape_md
 )
 from database import db
 
@@ -145,36 +145,6 @@ async def cb_send_branch_geolocation(call: CallbackQuery):
     )
 
 
-@router.callback_query(F.data.startswith("show_memo:"))
-async def cb_show_prep_memo(call: CallbackQuery):
-    parts = call.data.split(":")
-    memo_key = parts[1]
-    await call.answer()
-
-    apps = await db.get_user_active_appointments(call.from_user.id)
-    if apps:
-        app = apps[0]
-        formatted_date = date.fromisoformat(app["visit_date"]).strftime("%d.%m.%Y")
-        await db.render_step(
-            call.message,
-            memo_key,
-            service_title=app["service_title"],
-            formatted_date=formatted_date,
-            visit_time=app["visit_time"],
-            branch_title=app["branch_title"],
-            master_name=app["master_name"]
-        )
-    else:
-        await db.render_step(
-            call.message,
-            memo_key,
-            service_title="Выбранная процедура",
-            formatted_date="день визита",
-            visit_time="назначенное время",
-            branch_title="Sahar&Vosk",
-            master_name="Специалист студии"
-        )
-
 
 @router.message(F.text == "🎁 Акции")
 async def show_promotions(message: Message, state: FSMContext):
@@ -214,7 +184,11 @@ async def select_support_branch(call: CallbackQuery, state: FSMContext):
     await call.answer()
 
 
-@router.message(SupportState.chatting, F.text == "❌ Завершить диалог с администратором")
+@router.message(
+    StateFilter(SupportState.chatting, None),
+    F.chat.type == "private",
+    F.text == "❌ Завершить диалог с администратором"
+)
 async def exit_client_support(message: Message, state: FSMContext):
     await state.clear()
     await message.answer(
@@ -255,13 +229,14 @@ async def forward_client_message_to_admins_and_archive(message: Message, branch_
         photo_id=photo_id
     )
 
-    user_link = f" (@{username})" if username else ""
+    user_link = f" (@{escape_md(username)})" if username else ""
+    safe_msg_text = escape_md(text) if text else "[Изображение]"
     admin_alert_text = (
         f"📩 **Новое обращение · Sahar&Vosk**\n"
         f"────────────────────\n"
-        f"📍 **Студия:** {branch_title}\n"
-        f"👤 **Клиент:** {client_name}{user_link} (`{message.from_user.id}`)\n\n"
-        f"💬 {text or '[Изображение]'}"
+        f"📍 **Студия:** {escape_md(branch_title)}\n"
+        f"👤 **Клиент:** {escape_md(client_name)}{user_link} (`{message.from_user.id}`)\n\n"
+        f"💬 {safe_msg_text}"
     )
     await notify_admins(
         message.bot,
@@ -273,6 +248,7 @@ async def forward_client_message_to_admins_and_archive(message: Message, branch_
 
 @router.message(
     SupportState.chatting,
+    F.chat.type == "private",
     F.photo | (F.text & ~F.text.in_(MAIN_MENU_BUTTONS) & ~F.text.startswith("/"))
 )
 async def process_client_support_message(message: Message, state: FSMContext):
@@ -283,6 +259,7 @@ async def process_client_support_message(message: Message, state: FSMContext):
 
 @router.message(
     StateFilter(None),
+    F.chat.type == "private",
     F.photo | (F.text & ~F.text.in_(MAIN_MENU_BUTTONS) & ~F.text.startswith("/"))
 )
 async def process_direct_client_reply(message: Message):

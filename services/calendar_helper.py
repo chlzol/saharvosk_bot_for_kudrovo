@@ -2,6 +2,12 @@ import urllib.parse
 from datetime import datetime, timezone, timedelta
 
 
+def _parse_visit_dt(visit_date: str, visit_time: str) -> datetime:
+    parts = str(visit_time).split(":")
+    norm_time = f"{int(parts[0]):02d}:{int(parts[1]):02d}"
+    return datetime.fromisoformat(f"{visit_date}T{norm_time}:00")
+
+
 def generate_google_calendar_url(
     title: str,
     visit_date: str,
@@ -11,20 +17,38 @@ def generate_google_calendar_url(
     description: str
 ) -> str:
     """Генерирует прямую ссылку для мгновенного добавления визита в Google Календарь."""
-    start_dt = datetime.fromisoformat(f"{visit_date}T{visit_time}:00")
+    start_dt = _parse_visit_dt(visit_date, visit_time)
     end_dt = start_dt + timedelta(minutes=duration_min)
 
     dates_str = f"{start_dt.strftime('%Y%m%dT%H%M%S')}/{end_dt.strftime('%Y%m%dT%H%M%S')}"
 
-    params = {
-        "action": "TEMPLATE",
-        "text": title,
-        "dates": dates_str,
-        "ctz": "Europe/Moscow",
-        "details": description,
-        "location": location
-    }
-    return "https://calendar.google.com/calendar/render?" + urllib.parse.urlencode(params)
+    base_url = "https://calendar.google.com/calendar/render?"
+    desc_text = description or ""
+    title_text = title or ""
+
+    def _build_url(t: str, d: str) -> str:
+        params = {
+            "action": "TEMPLATE",
+            "text": t,
+            "dates": dates_str,
+            "ctz": "Europe/Moscow",
+            "details": d,
+            "location": location
+        }
+        return base_url + urllib.parse.urlencode(params)
+
+    url = _build_url(title_text, desc_text)
+    if len(url) > 1900:
+        while desc_text and len(url) > 1900:
+            cut = max(0, len(desc_text) - max(10, (len(url) - 1900) // 4))
+            desc_text = (desc_text[:cut].rstrip() + "...") if cut > 0 else ""
+            url = _build_url(title_text, desc_text)
+        while title_text and len(url) > 1900:
+            title_text = title_text[:-10].rstrip() + "..." if len(title_text) > 15 else title_text[:10]
+            url = _build_url(title_text, desc_text)
+            if len(title_text) <= 10:
+                break
+    return url
 
 
 def generate_ics_content(
@@ -37,16 +61,16 @@ def generate_ics_content(
     description: str
 ) -> bytes:
     """Генерирует файл формата .ics со встроенным напоминанием за 2 часа для Apple Calendar и смартфонов."""
-    start_dt = datetime.fromisoformat(f"{visit_date}T{visit_time}:00")
+    start_dt = _parse_visit_dt(visit_date, visit_time)
     end_dt = start_dt + timedelta(minutes=duration_min)
     now_utc = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
     dtstart_str = start_dt.strftime("%Y%m%dT%H%M%S")
     dtend_str = end_dt.strftime("%Y%m%dT%H%M%S")
 
-    clean_desc = description.replace("\\", "\\\\").replace("\n", "\\n").replace(",", "\\,").replace(";", "\\;")
-    clean_title = title.replace("\\", "\\\\").replace("\n", " ").replace(",", "\\,").replace(";", "\\;")
-    clean_loc = location.replace("\\", "\\\\").replace("\n", " ").replace(",", "\\,").replace(";", "\\;")
+    clean_desc = (description or "").replace("\r", "").replace("\\", "\\\\").replace("\n", "\\n").replace(",", "\\,").replace(";", "\\;")
+    clean_title = (title or "").replace("\r", "").replace("\\", "\\\\").replace("\n", " ").replace(",", "\\,").replace(";", "\\;")
+    clean_loc = (location or "").replace("\r", "").replace("\\", "\\\\").replace("\n", " ").replace(",", "\\,").replace(";", "\\;")
 
     ics_text = (
         "BEGIN:VCALENDAR\r\n"

@@ -8,16 +8,17 @@ from services import booking_service as bs
 from services import yclients_api
 from keyboards import inline as ikb
 
-scheduler = AsyncIOScheduler()
 MSK_TZ = timezone(timedelta(hours=3))
+scheduler = AsyncIOScheduler(timezone=MSK_TZ)
 
 
 def now_msk() -> datetime:
     return datetime.now(MSK_TZ).replace(tzinfo=None)
 
 
-async def _is_appointment_still_valid(app: dict | None) -> bool:
-    if not app or app.get("status") != "active":
+async def _is_appointment_still_valid(app: dict | None, allow_completed: bool = False) -> bool:
+    allowed = ("active", "completed") if allow_completed else ("active",)
+    if not app or app.get("status") not in allowed:
         return False
 
     yc_active = await yclients_api.is_yclients_record_active(
@@ -87,25 +88,11 @@ async def send_1h_reminder(bot: Bot, appointment_id: int, force: bool = False):
 
 async def send_aftercare_and_nps(bot: Bot, appointment_id: int, force: bool = False):
     app = await db.get_appointment_by_id(appointment_id)
-    if not force and not await _is_appointment_still_valid(app):
-        logging.info(f"Запись #{appointment_id} была отменена — пост-уход и запрос отзыва НЕ отправляются.")
+    if not force and not await _is_appointment_still_valid(app, allow_completed=True):
+        logging.info(f"Запись #{appointment_id} была отменена — запрос отзыва НЕ отправляется.")
         return
     if not app:
         return
-
-    _, after_memo_key = bs.get_memo_keys_for_appointment(app.get("cat_id", ""), app.get("service_title", ""))
-
-    try:
-        await db.render_step_to_chat(
-            bot,
-            chat_id=app["telegram_id"],
-            step_key=after_memo_key,
-            service_title=app["service_title"],
-            master_name=app["master_name"],
-            branch_title=app["branch_title"]
-        )
-    except Exception as e:
-        logging.error(f"Ошибка отправки памятки пост-ухода #{appointment_id}: {e}")
 
     if not await db.has_review_for_appointment(appointment_id):
         try:
@@ -124,7 +111,7 @@ async def send_aftercare_and_nps(bot: Bot, appointment_id: int, force: bool = Fa
 
 async def send_repeat_reminder(bot: Bot, appointment_id: int, force: bool = False):
     app = await db.get_appointment_by_id(appointment_id)
-    if not force and not await _is_appointment_still_valid(app):
+    if not force and not await _is_appointment_still_valid(app, allow_completed=True):
         return
     if not app:
         return
@@ -154,12 +141,14 @@ def remove_appointment_reminders(appointment_id: int):
 
 async def schedule_appointment_reminders(bot: Bot, appointment_id: int):
     app = await db.get_appointment_by_id(appointment_id)
-    if not app or app["status"] != "active":
+    if not app or app["status"] not in ("active", "completed"):
         return
 
     remove_appointment_reminders(appointment_id)
 
-    visit_dt = datetime.fromisoformat(f"{app['visit_date']}T{app['visit_time']}:00")
+    time_parts = str(app["visit_time"]).split(":")
+    norm_time = f"{int(time_parts[0]):02d}:{int(time_parts[1]):02d}"
+    visit_dt = datetime.fromisoformat(f"{app['visit_date']}T{norm_time}:00")
     now = now_msk()
     duration_min = int(app.get("duration", 30) or 30)
 
@@ -210,7 +199,7 @@ async def schedule_appointment_reminders(bot: Bot, appointment_id: int):
 
 
 async def restore_all_reminders(bot: Bot):
-    apps = await db.get_all_active_appointments("all")
+    apps = await db.get_appointments_for_scheduler()
     for app in apps:
         await schedule_appointment_reminders(bot, app["id"])
 

@@ -326,89 +326,7 @@ BASE_STEPS = {
         "hints": "{appointment_id}, {address}, {service_title}, {price}, {master_name}, {formatted_date}, {visit_time}"
     },
 
-    # --- ГРУППА 5: ПАМЯТКИ, НАПОМИНАНИЯ И ОТЗЫВЫ (NPS) ---
-    "memo_prep_laser": {
-        "group": "memos",
-        "title": "📋 Памятка: Подготовка к Лазерной эпиляции",
-        "text": (
-            "✨ **Sahar&Vosk · Подготовка к лазерной SHR-эпиляции**\n"
-            "────────────────────\n"
-            "Для достижения максимального эффекта и комфорта, пожалуйста, ознакомьтесь с рекомендациями:\n\n"
-            "· **За 12–24 часа до визита** гладко сбрейте волоски обычным станком на зоне проведения процедуры.\n"
-            "· **За 2–3 недели до сеанса** исключите использование воска, шугаринга, пинцета или эпилятором.\n"
-            "· **За 3–5 дней до процедуры** воздержитесь от активного загара, солярия и автозагара.\n"
-            "· **В день визита** не наносите на кожу масла, плотные кремы и спиртосодержащие дезодоранты.\n\n"
-            "С заботой о вас, **Sahar&Vosk** 🤍"
-        ),
-        "hints": "{service_title}, {formatted_date}, {visit_time}, {branch_title}"
-    },
-    "memo_prep_depil": {
-        "group": "memos",
-        "title": "📋 Памятка: Подготовка к Шугарингу и Воску",
-        "text": (
-            "✨ **Sahar&Vosk · Подготовка к депиляции**\n"
-            "────────────────────\n"
-            "Чтобы процедура прошла максимально деликатно и гладко:\n\n"
-            "· **Оптимальная длина волосков — 4–6 мм** (обычно 10–14 дней после бритвы).\n"
-            "· **За сутки до визита** можно бережно очистить кожу мягким скрабом, но не используйте жёсткие мочалки в день процедуры.\n"
-            "· **В день визита** не наносите на кожу плотные кремы, масла и лосьоны.\n"
-            "· **Комфорт:** рекомендуем выбрать свободное бельё и одежду из натуральных дышащих тканей.\n\n"
-            "Ждём вас в **Sahar&Vosk** 🤍"
-        ),
-        "hints": "{service_title}, {formatted_date}, {visit_time}, {branch_title}"
-    },
-    "memo_prep_general": {
-        "group": "memos",
-        "title": "📋 Памятка: Подготовка к визиту (Общая)",
-        "text": (
-            "✨ **Sahar&Vosk · Памятка перед визитом**\n"
-            "────────────────────\n"
-            "· Рекомендуем подойти за 5–10 минут до начала визита, чтобы спокойно подготовиться и выпить чашечку чая или кофе.\n"
-            "· **Перед маникюром или педикюром** в день визита желательно не наносить жирные кремы и масла для кутикулы.\n"
-            "· **Перед процедурами для ресниц и бровей** рекомендуем воздержаться от водостойкой туши и масляных средств.\n\n"
-            "До скорой встречи в **Sahar&Vosk** 🤍"
-        ),
-        "hints": "{service_title}, {formatted_date}, {visit_time}, {branch_title}"
-    },
-    "memo_after_laser": {
-        "group": "memos",
-        "title": "🌿 Памятка: Пост-уход после Лазерной эпиляции",
-        "text": (
-            "🌿 **Sahar&Vosk · Уход после лазерной SHR-эпиляции**\n"
-            "────────────────────\n"
-            "· **Первые 24–48 часов** избегайте перегрева кожи: воздержитесь от горячей ванны, бани, сауны, солярия, бассейна и интенсивных тренировок.\n"
-            "· **Первые 3 дня** не используйте скрабы, жёсткие мочалки и спиртосодержащие средства на обработанной зоне.\n"
-            "· **Увлажнение:** в течение 2–3 дней наносите на кожу лёгкий успокаивающий крем (например, с пантенолом).\n"
-            "· **Защита от солнца:** на открытых участках тела используйте SPF 30–50.\n"
-            "· **Между сеансами курса** удаляйте отрастающие волоски только бритвенным станком."
-        ),
-        "hints": "{service_title}, {master_name}, {branch_title}"
-    },
-    "memo_after_depil": {
-        "group": "memos",
-        "title": "🌿 Памятка: Пост-уход после Шугаринга и Воска",
-        "text": (
-            "🌿 **Sahar&Vosk · Уход после депиляции**\n"
-            "────────────────────\n"
-            "· **В первые 24 часа** исключите посещение бани, сауны, горячей ванны, бассейна, солярия и активные тренировки.\n"
-            "· **При депиляции подмышек** в первые сутки воздержитесь от спиртосодержащих дезодорантов; **при депиляции лица** — от плотных тональных средств.\n"
-            "· **Первые 3–4 дня** не используйте скрабы и жёсткие мочалки.\n"
-            "· **Домашний уход:** через 4–5 дней подключите ежедневное увлажнение кожи и мягкий энзимный пилинг 1–2 раза в неделю."
-        ),
-        "hints": "{service_title}, {master_name}, {branch_title}"
-    },
-    "memo_after_general": {
-        "group": "memos",
-        "title": "🌿 Памятка: Пост-уход после процедуры (Общая)",
-        "text": (
-            "🌿 **Sahar&Vosk · Рекомендации после визита**\n"
-            "────────────────────\n"
-            "· **После ламинирования/наращивания ресниц и оформления бровей** в первые 24 часа избегайте сауны, бани и воздействия пара, не трите глаза и брови.\n"
-            "· **После массажа и SPA-ритуалов** рекомендуем пить больше чистой воды.\n"
-            "· **После маникюра и педикюра** ежедневно используйте увлажняющий крем и масло для кутикулы."
-        ),
-        "hints": "{service_title}, {master_name}, {branch_title}"
-    },
+    # --- ГРУППА 5: НАПОМИНАНИЯ И ОТЗЫВЫ (NPS) ---
     "rem_24h": {
         "group": "memos",
         "title": "🔔 Напоминание за 24 часа до визита",
@@ -595,7 +513,7 @@ def get_step_group(step_key: str) -> str:
         return "cats"
     if step_key.startswith("sc_") or step_key.startswith("s2_"):
         return "subcats"
-    if step_key.startswith(("memo_", "rem_", "nps_")):
+    if step_key.startswith(("rem_", "nps_")):
         return "memos"
     if step_key.startswith("step_"):
         return "booking"
@@ -605,6 +523,18 @@ def get_step_group(step_key: str) -> str:
 class SafeFormatDict(dict):
     def __missing__(self, key):
         return "{" + key + "}"
+
+
+def _format_step_text(raw_text: str, kwargs: dict) -> str:
+    if not raw_text:
+        return ""
+    try:
+        return raw_text.format_map(SafeFormatDict(kwargs))
+    except Exception:
+        text = raw_text
+        for k, v in kwargs.items():
+            text = text.replace("{" + str(k) + "}", str(v))
+        return text
 
 
 def _connect():
@@ -742,6 +672,8 @@ async def init_db():
 
         for cat_id, days in DEFAULT_REPEAT_DAYS.items():
             await db.execute("INSERT OR IGNORE INTO repeat_settings (cat_id, days) VALUES (?, ?)", (cat_id, days))
+
+        await db.execute("DELETE FROM step_content WHERE step_key LIKE 'memo_%'")
 
         for step_key, info in DEFAULT_STEPS.items():
             await db.execute(
@@ -972,7 +904,7 @@ async def clear_test_cache():
         await db.commit()
 
 
-# --- КОНТЕНТ ШАГОВ, КАТЕГОРИЙ, ПОДКАТЕГОРИЙ И ПАМЯТОК ---
+# --- КОНТЕНТ ШАГОВ, КАТЕГОРИЙ И ПОДКАТЕГОРИЙ ---
 
 async def get_all_steps() -> list[dict]:
     async with _connect() as db:
@@ -1066,7 +998,7 @@ async def render_step_to_chat(
 ):
     step = await get_step_content(step_key, fallback_key=fallback_key)
     raw_text = step["custom_text"] or DEFAULT_STEPS.get(step_key, {}).get("text", "")
-    text = raw_text.format_map(SafeFormatDict(kwargs))
+    text = _format_step_text(raw_text, kwargs) or " "
     photo_id = step.get("photo_id")
 
     if photo_id and len(text) <= 1024:
@@ -1102,7 +1034,7 @@ async def render_step(
 ):
     step = await get_step_content(step_key, fallback_key=fallback_key)
     raw_text = step["custom_text"] or DEFAULT_STEPS.get(step_key, {}).get("text", "")
-    text = raw_text.format_map(SafeFormatDict(kwargs))
+    text = _format_step_text(raw_text, kwargs) or " "
     photo_id = step.get("photo_id")
 
     if isinstance(target, Message):
@@ -1111,7 +1043,11 @@ async def render_step(
                 await target.answer_photo(photo=photo_id, caption=text, reply_markup=reply_markup, parse_mode="Markdown")
                 return
             except TelegramBadRequest:
-                await target.answer_photo(photo=photo_id, caption=text, reply_markup=reply_markup)
+                try:
+                    await target.answer_photo(photo=photo_id, caption=text, reply_markup=reply_markup)
+                    return
+                except Exception:
+                    pass
                 return
         elif photo_id and len(text) > 1024:
             try:
@@ -1130,7 +1066,20 @@ async def render_step(
     if not force_new and not has_old_photo and not photo_id:
         try:
             await msg.edit_text(text=text[:4096], reply_markup=reply_markup, parse_mode="Markdown", disable_web_page_preview=True)
-        except TelegramBadRequest:
+        except TelegramBadRequest as e:
+            err_lower = str(e).lower()
+            if "message is not modified" in err_lower:
+                return
+            if "message can't be edited" in err_lower or "message to edit not found" in err_lower:
+                try:
+                    await msg.answer(text=text[:4096], reply_markup=reply_markup, parse_mode="Markdown", disable_web_page_preview=True)
+                    return
+                except TelegramBadRequest:
+                    try:
+                        await msg.answer(text=text[:4096], reply_markup=reply_markup, disable_web_page_preview=True)
+                        return
+                    except Exception:
+                        pass
             try:
                 await msg.edit_text(text=text[:4096], reply_markup=reply_markup, disable_web_page_preview=True)
             except Exception:
@@ -1145,7 +1094,11 @@ async def render_step(
                 await msg.answer_photo(photo=photo_id, caption=text, reply_markup=reply_markup, parse_mode="Markdown")
                 return
             except TelegramBadRequest:
-                await msg.answer_photo(photo=photo_id, caption=text, reply_markup=reply_markup)
+                try:
+                    await msg.answer_photo(photo=photo_id, caption=text, reply_markup=reply_markup)
+                    return
+                except Exception:
+                    pass
                 return
         elif photo_id and len(text) > 1024:
             try:
@@ -1285,6 +1238,7 @@ async def get_user_active_appointments(telegram_id: int) -> list[dict]:
         return [dict(row) for row in rows]
 
 
+
 async def get_all_active_appointments(branch_id: str | None = None) -> list[dict]:
     async with _connect() as db:
         await _archive_past_appointments(db)
@@ -1301,6 +1255,21 @@ async def get_all_active_appointments(branch_id: str | None = None) -> list[dict
                 WHERE status = 'active'
                 ORDER BY visit_date ASC, visit_time ASC
             """)
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+
+async def get_appointments_for_scheduler() -> list[dict]:
+    cutoff = (now_msk().date() - timedelta(days=366)).isoformat()
+    async with _connect() as db:
+        await _archive_past_appointments(db)
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("""
+            SELECT * FROM appointments
+            WHERE status = 'active'
+               OR (status = 'completed' AND visit_date >= ?)
+            ORDER BY visit_date ASC, visit_time ASC
+        """, (cutoff,))
         rows = await cursor.fetchall()
         return [dict(row) for row in rows]
 

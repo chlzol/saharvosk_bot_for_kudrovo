@@ -2,7 +2,7 @@ import asyncio
 import html
 from datetime import date
 from aiogram import Router, F, Bot
-from aiogram.filters import Command
+from aiogram.filters import Command, StateFilter
 from aiogram.types import Message, CallbackQuery, BufferedInputFile, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.context import FSMContext
 from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
@@ -18,6 +18,49 @@ from keyboards.default import get_main_keyboard, get_admin_chat_kb, MAIN_MENU_BU
 from keyboards import inline as ikb
 
 router = Router()
+_ADMIN_MSG_FILTER = (F.text == None) | (~F.text.in_(MAIN_MENU_BUTTONS) & ~F.text.startswith("/"))
+_pending_broadcasts: set[int] = set()
+
+
+def escape_md(value: str | None) -> str:
+    if not value:
+        return ""
+    return (
+        str(value)
+        .replace("\\", "\\\\")
+        .replace("_", "\\_")
+        .replace("*", "\\*")
+        .replace("`", "\\`")
+        .replace("[", "\\[")
+    )
+
+
+def _clip_html_preview(raw_text: str | None, max_escaped_len: int = 2800) -> str:
+    txt = raw_text or ""
+    if len(txt) <= max_escaped_len:
+        escaped = html.escape(txt)
+        if len(escaped) <= max_escaped_len:
+            return escaped
+    suffix = "\n... [текст сокращён для предпросмотра]"
+    cut = min(len(txt), max_escaped_len)
+    while cut > 0:
+        escaped = html.escape(txt[:cut] + suffix)
+        if len(escaped) <= max_escaped_len:
+            return escaped
+        cut -= 200
+    return html.escape(suffix.strip())
+
+
+async def _safe_admin_edit_md(message: Message, text: str, reply_markup=None):
+    try:
+        await message.edit_text(text[:4096], reply_markup=reply_markup, parse_mode="Markdown")
+    except TelegramBadRequest as e:
+        if "message is not modified" in str(e).lower():
+            return
+        try:
+            await message.edit_text(text[:4096], reply_markup=reply_markup)
+        except Exception:
+            pass
 
 SEGMENT_TITLES = {
     "all": "Все гости студий Sahar&Vosk",
@@ -53,9 +96,9 @@ async def notify_admins(bot: Bot, text: str, reply_markup=None, photo_id: str | 
                     await bot.send_photo(chat_id=admin_id, photo=photo_id, caption=text[:1024], reply_markup=reply_markup)
             else:
                 try:
-                    await bot.send_message(chat_id=admin_id, text=text, reply_markup=reply_markup, parse_mode="Markdown")
+                    await bot.send_message(chat_id=admin_id, text=text[:4096], reply_markup=reply_markup, parse_mode="Markdown")
                 except TelegramBadRequest:
-                    await bot.send_message(chat_id=admin_id, text=text, reply_markup=reply_markup)
+                    await bot.send_message(chat_id=admin_id, text=text[:4096], reply_markup=reply_markup)
         except Exception:
             pass
 
@@ -79,25 +122,30 @@ async def send_to_archive_group(
     user_tag = f" (@{username})" if username else ""
     phone = await db.get_user_phone(client_id)
     phone_str = f" · 📞 <code>{html.escape(phone)}</code>" if phone else ""
-    body = html.escape(text or "[Изображение / Медиафайл]")
+    raw_body = text or "[Изображение / Медиафайл]"
 
     if direction == "from_client":
-        full_msg = (
+        header_html = (
             f"📥 <b>КЛИЕНТ ➡️ Sahar&Vosk ({html.escape(branch_title)})</b>\n"
             f"🔎 Профиль: #id{client_id}\n"
             f"👤 <b>{html.escape(client_name)}</b>{html.escape(user_tag)}{phone_str}\n"
             f"────────────────────\n"
-            f"🆔 <code>{client_id}</code> · <b>{html.escape(client_name)}:</b> {body}"
+            f"🆔 <code>{client_id}</code> · <b>{html.escape(client_name)}:</b> "
         )
     else:
-        full_msg = (
+        header_html = (
             f"📤 <b>АДМИНИСТРАТОР ({html.escape(admin_name or 'Администратор')}) ➡️ КЛИЕНТУ</b>\n"
             f"📍 Студия: Sahar&Vosk ({html.escape(branch_title)})\n"
             f"🔎 Профиль: #id{client_id}\n"
             f"👤 Кому: <b>{html.escape(client_name)}</b>{html.escape(user_tag)}{phone_str}\n"
             f"────────────────────\n"
-            f"🆔 <code>{client_id}</code> · <b>Ответ:</b> {body}"
+            f"🆔 <code>{client_id}</code> · <b>Ответ:</b> "
         )
+
+    max_len = 1024 if photo_id else 4096
+    max_body_len = max(64, max_len - len(header_html))
+    body_html = _clip_html_preview(raw_body, max_escaped_len=max_body_len)
+    full_msg = (header_html + body_html)[:max_len]
 
     try:
         bot_me = await bot.get_me()
@@ -106,14 +154,14 @@ async def send_to_archive_group(
             await bot.send_photo(
                 chat_id=group_id,
                 photo=photo_id,
-                caption=full_msg[:1024],
+                caption=full_msg,
                 reply_markup=kb,
                 parse_mode="HTML"
             )
         else:
             await bot.send_message(
                 chat_id=group_id,
-                text=full_msg[:4096],
+                text=full_msg,
                 reply_markup=kb,
                 parse_mode="HTML"
             )
@@ -170,7 +218,7 @@ async def cb_admin_home(call: CallbackQuery, state: FSMContext):
         return
     await state.clear()
     text, unread = await build_admin_dashboard_text()
-    await call.message.edit_text(text, reply_markup=ikb.admin_main_kb(unread), parse_mode="Markdown")
+    await _safe_admin_edit_md(call.message, text, reply_markup=ikb.admin_main_kb(unread))
     await call.answer()
 
 
@@ -220,17 +268,18 @@ async def cb_admin_sync_yclients(call: CallbackQuery):
             f"📂 **Всего в каталоге:** {sync_stats['total_services']} процедур и {sync_stats['total_masters']} специалистов.\n\n"
             "────────────────────\n" + dash_text
         )
-        await call.message.edit_text(
+        await _safe_admin_edit_md(
+            call.message,
             result_text,
-            reply_markup=ikb.admin_main_kb(unread),
-            parse_mode="Markdown"
+            reply_markup=ikb.admin_main_kb(unread)
         )
     except Exception as e:
         dash_text, unread = await build_admin_dashboard_text()
-        await call.message.edit_text(
-            f"✕ **Ошибка синхронизации:** `{e}`\n\n" + dash_text,
-            reply_markup=ikb.admin_main_kb(unread),
-            parse_mode="Markdown"
+        err_safe = str(e).replace("`", "'")[:300]
+        await _safe_admin_edit_md(
+            call.message,
+            f"✕ **Ошибка синхронизации:** `{err_safe}`\n\n" + dash_text,
+            reply_markup=ikb.admin_main_kb(unread)
         )
 
 
@@ -322,15 +371,20 @@ async def open_client_chat_for_admin(target_message: Message, state: FSMContext,
     if not messages:
         history_lines.append("<i>История сообщений пуста.</i>")
     else:
+        msg_blocks = []
         for m in messages:
             time_short = m["created_at"][5:16] if m.get("created_at") else ""
             role = f"👤 {html.escape(thread['client_name'] or 'Гость')}" if m["sender"] == "client" else f"🛡 {html.escape(m['sender_name'] or 'Администратор')}"
-            content = html.escape(m["text"] or "")
+            content = _clip_html_preview(m["text"] or "", max_escaped_len=240)
             if m.get("photo_id"):
                 content = f"🖼 [Изображение] {content}"
                 if m["sender"] == "client":
                     photos_to_duplicate.append((m["photo_id"], m["text"] or "", time_short))
-            history_lines.append(f"<b>{role}</b> <i>({time_short})</i>:\n{content}\n")
+            msg_blocks.append(f"<b>{role}</b> <i>({time_short})</i>:\n{content}\n")
+        footer_reserve = 320
+        while msg_blocks and len("\n".join(history_lines + msg_blocks)) + footer_reserve > 4096:
+            msg_blocks.pop(0)
+        history_lines.extend(msg_blocks)
 
     history_lines.append("────────────────────")
     history_lines.append(
@@ -375,8 +429,10 @@ async def cb_admin_open_client_chat(call: CallbackQuery, state: FSMContext):
     await call.answer()
 
 
-@router.message(AdminState.chatting_with_client, F.text == "🚪 Выйти из диалога")
+@router.message(StateFilter(AdminState.chatting_with_client, None), F.chat.type == "private", F.text == "🚪 Выйти из диалога")
 async def admin_exit_chat_button(message: Message, state: FSMContext):
+    if not await check_admin(message.from_user.id):
+        return
     await state.clear()
     await message.answer("✨ Вы вышли из режима диалога с гостем.", reply_markup=get_main_keyboard())
     text, unread = await build_admin_dashboard_text()
@@ -403,6 +459,10 @@ async def process_admin_chat_message(message: Message, state: FSMContext):
 
     data = await state.get_data()
     client_id = data.get("active_client_id")
+    if not client_id:
+        await state.clear()
+        await message.answer("⚠️ Диалог не выбран или сессия сброшена.", reply_markup=get_main_keyboard())
+        return
     client_name = data.get("active_client_name", "Гость")
     client_username = data.get("active_client_username")
     branch_id = data.get("active_branch_id", "prazhskaya")
@@ -475,7 +535,7 @@ async def cb_admin_clear_cache_confirm(call: CallbackQuery, state: FSMContext):
 
 
 # =====================================================================
-# РЕДАКТОР ВСЕХ ШАГОВ, КАТЕГОРИЙ, ПОДКАТЕГОРИЙ, ПРАЙСА И ПАМЯТОК
+# РЕДАКТОР ВСЕХ ШАГОВ, КАТЕГОРИЙ, ПОДКАТЕГОРИЙ И ПРАЙСА
 # =====================================================================
 
 @router.callback_query(F.data == "adm:steps")
@@ -537,7 +597,7 @@ async def cb_admin_step_card(call: CallbackQuery, state: FSMContext):
     group = db.get_step_group(step_key)
 
     photo_status = "✓ Прикреплено" if step.get("photo_id") else "✕ Отсутствует"
-    escaped_text = html.escape(step["custom_text"])
+    escaped_text = _clip_html_preview(step["custom_text"])
     escaped_title = html.escape(step["title"])
 
     text = (
@@ -567,8 +627,8 @@ async def cb_admin_edit_step_text(call: CallbackQuery, state: FSMContext):
     await state.set_state(AdminState.editing_step_text)
 
     escaped_title = html.escape(step["title"])
-    escaped_text = html.escape(step["custom_text"])
-    escaped_hints = html.escape(step["hints"])
+    escaped_text = _clip_html_preview(step["custom_text"], max_escaped_len=2400)
+    escaped_hints = html.escape(step["hints"] or "")
 
     text = (
         f"✏️ <b>Редактирование: «{escaped_title}»</b>\n"
@@ -585,12 +645,19 @@ async def cb_admin_edit_step_text(call: CallbackQuery, state: FSMContext):
     await call.answer()
 
 
-@router.message(AdminState.editing_step_text)
+@router.message(AdminState.editing_step_text, _ADMIN_MSG_FILTER)
 async def process_edited_step_text(message: Message, state: FSMContext):
     if not await check_admin(message.from_user.id):
         return
     if not message.text:
         await message.answer("⚠️ Пожалуйста, отправьте текстовый вариант сообщения.")
+        return
+
+    data = await state.get_data()
+    step_key = data.get("edit_step_key")
+    if not step_key:
+        await state.clear()
+        await message.answer("🔄 Сессия редактирования истекла. Откройте /admin заново.")
         return
 
     new_text = message.text.strip()
@@ -599,8 +666,6 @@ async def process_edited_step_text(message: Message, state: FSMContext):
     if new_text.startswith(prefix):
         new_text = new_text[len(prefix):].lstrip()
 
-    data = await state.get_data()
-    step_key = data["edit_step_key"]
     group = db.get_step_group(step_key)
 
     await db.update_step_text(step_key, new_text)
@@ -612,7 +677,7 @@ async def process_edited_step_text(message: Message, state: FSMContext):
         f"✓ <b>Текст «{html.escape(step['title'])}» обновлён!</b>\n"
         "────────────────────\n"
         f"🖼 <b>Изображение:</b> {photo_status}\n\n"
-        f"📝 <b>Новый текст:</b>\n<pre>{html.escape(step['custom_text'])}</pre>",
+        f"📝 <b>Новый текст:</b>\n<pre>{_clip_html_preview(step['custom_text'])}</pre>",
         reply_markup=ikb.admin_step_actions_kb(step_key, bool(step.get("photo_id")), group=group),
         parse_mode="HTML"
     )
@@ -634,7 +699,7 @@ async def cb_admin_reset_step_text(call: CallbackQuery, state: FSMContext):
         f"⚙️ <b>Настройка: {html.escape(step['title'])}</b>\n"
         "────────────────────\n"
         f"🖼 <b>Изображение:</b> {photo_status}\n\n"
-        f"📝 <b>Текущий текст:</b>\n<pre>{html.escape(step['custom_text'])}</pre>",
+        f"📝 <b>Текущий текст:</b>\n<pre>{_clip_html_preview(step['custom_text'])}</pre>",
         reply_markup=ikb.admin_step_actions_kb(step_key, bool(step.get("photo_id")), group=group),
         parse_mode="HTML"
     )
@@ -664,7 +729,7 @@ async def cb_admin_edit_step_photo(call: CallbackQuery, state: FSMContext):
     await call.answer()
 
 
-@router.message(AdminState.editing_step_photo)
+@router.message(AdminState.editing_step_photo, _ADMIN_MSG_FILTER)
 async def process_edited_step_photo(message: Message, state: FSMContext):
     if not await check_admin(message.from_user.id):
         return
@@ -672,9 +737,14 @@ async def process_edited_step_photo(message: Message, state: FSMContext):
         await message.answer("⚠️ Пожалуйста, отправьте изображение или нажмите «‹ Назад к карточке шага».")
         return
 
-    photo_id = message.photo[-1].file_id
     data = await state.get_data()
-    step_key = data["edit_step_key"]
+    step_key = data.get("edit_step_key")
+    if not step_key:
+        await state.clear()
+        await message.answer("🔄 Сессия редактирования истекла. Откройте /admin заново.")
+        return
+
+    photo_id = message.photo[-1].file_id
     group = db.get_step_group(step_key)
 
     await db.update_step_photo(step_key, photo_id)
@@ -685,7 +755,7 @@ async def process_edited_step_photo(message: Message, state: FSMContext):
         f"✓ <b>Изображение для экрана «{html.escape(step['title'])}» сохранено!</b>\n"
         "────────────────────\n"
         f"🖼 <b>Изображение:</b> ✓ Прикреплено\n\n"
-        f"📝 <b>Текущий текст:</b>\n<pre>{html.escape(step['custom_text'])}</pre>",
+        f"📝 <b>Текущий текст:</b>\n<pre>{_clip_html_preview(step['custom_text'])}</pre>",
         reply_markup=ikb.admin_step_actions_kb(step_key, True, group=group),
         parse_mode="HTML"
     )
@@ -777,7 +847,7 @@ async def build_admins_view():
         lines.append("· *Дополнительных администраторов нет*")
     else:
         for a in extra_admins:
-            lines.append(f"· **{a['name']}** — ID: `{a['telegram_id']}` *(добавлен {a['added_at']})*")
+            lines.append(f"· **{escape_md(a['name'])}** — ID: `{a['telegram_id']}` *(добавлен {a['added_at']})*")
 
     return "\n".join(lines), ikb.admin_manage_admins_kb(db_admins, ADMIN_IDS)
 
@@ -797,7 +867,7 @@ async def cb_admin_start_add_admin(call: CallbackQuery, state: FSMContext):
     await call.answer()
 
 
-@router.message(AdminState.adding_admin)
+@router.message(AdminState.adding_admin, _ADMIN_MSG_FILTER)
 async def process_add_admin(message: Message, state: FSMContext):
     if not await check_admin(message.from_user.id):
         return
@@ -820,14 +890,15 @@ async def process_add_admin(message: Message, state: FSMContext):
     if not new_admin_id:
         await message.answer(
             "⚠️ Не удалось определить ID. Попросите пользователя отправить боту `/my_id` и скопируйте число сюда.",
-            reply_markup=ikb.admin_cancel_input_kb("adm:admins")
+            reply_markup=ikb.admin_cancel_input_kb("adm:admins"),
+            parse_mode="Markdown"
         )
         return
 
     await db.add_db_admin(new_admin_id, new_admin_name)
     await state.clear()
     text, kb = await build_admins_view()
-    await message.answer(f"✓ **{new_admin_name}** (`{new_admin_id}`) успешно добавлен!\n\n{text}", reply_markup=kb, parse_mode="Markdown")
+    await message.answer(f"✓ **{escape_md(new_admin_name)}** (`{new_admin_id}`) успешно добавлен!\n\n{text}", reply_markup=kb, parse_mode="Markdown")
 
 
 @router.callback_query(F.data.startswith("adm_mgr:del:"))
@@ -888,11 +959,14 @@ async def cb_admin_show_apps(call: CallbackQuery):
         formatted_date = date.fromisoformat(app["visit_date"]).strftime("%d.%m.%Y")
         conf_status = "✓ Подтверждён" if app.get("confirmed") else "⏳ Ожидает"
         price_str = f"{app['price']} ₽" if int(app.get("price", 0)) > 0 else "по прайсу"
+        srv_short = app["service_title"]
+        if len(srv_short) > 220:
+            srv_short = srv_short[:217] + "..."
         lines.append(
             f"🔹 <b>Запись №{app['id']}</b> · <i>{conf_status}</i>\n"
             f"📍 Sahar&Vosk · {html.escape(app['branch_title'])}\n"
             f"👤 <b>{html.escape(app['client_name'])}</b> (<code>{html.escape(app['phone'])}</code>)\n"
-            f"✨ {html.escape(app['service_title'])} ({price_str})\n"
+            f"✨ {html.escape(srv_short)} ({price_str})\n"
             f"👩‍⚕️ Специалист: {html.escape(app['master_name'])}\n"
             f"🗓 <b>{formatted_date} в {app['visit_time']}</b>\n"
         )
@@ -914,11 +988,15 @@ async def cb_admin_show_apps(call: CallbackQuery):
 
     buttons.append([InlineKeyboardButton(text="‹ К выбору студии", callback_data="adm:apps")])
 
-    await call.message.edit_text(
-        "\n".join(lines),
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
-        parse_mode="HTML"
-    )
+    try:
+        await call.message.edit_text(
+            "\n".join(lines)[:4096],
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+            parse_mode="HTML"
+        )
+    except TelegramBadRequest as e:
+        if "message is not modified" not in str(e).lower():
+            raise
     await call.answer()
 
 
@@ -936,18 +1014,20 @@ async def cb_admin_cancel_app(call: CallbackQuery):
     await yclients_api.delete_yclients_record(app["branch_id"], app.get("yclients_record_id"))
 
     formatted_date = date.fromisoformat(app["visit_date"]).strftime("%d.%m.%Y")
+    cancel_notice = (
+        f"✨ **Уведомление от студии Sahar&Vosk**\n"
+        f"────────────────────\n"
+        f"Ваш визит №{app_id} на {formatted_date} в {app['visit_time']} "
+        f"({escape_md(app['service_title'])}) был отменён администратором студии.\n\n"
+        "Будем рады подобрать для вас другое удобное время онлайн или по телефону."
+    )
     try:
-        await call.bot.send_message(
-            chat_id=app["telegram_id"],
-            text=(
-                f"✨ **Уведомление от студии Sahar&Vosk**\n"
-                f"────────────────────\n"
-                f"Ваш визит №{app_id} на {formatted_date} в {app['visit_time']} "
-                f"({app['service_title']}) был отменён администратором студии.\n\n"
-                "Будем рады подобрать для вас другое удобное время онлайн или по телефону."
-            ),
-            parse_mode="Markdown"
-        )
+        await call.bot.send_message(chat_id=app["telegram_id"], text=cancel_notice, parse_mode="Markdown")
+    except TelegramBadRequest:
+        try:
+            await call.bot.send_message(chat_id=app["telegram_id"], text=cancel_notice.replace("**", ""))
+        except Exception:
+            pass
     except Exception:
         pass
 
@@ -991,17 +1071,25 @@ async def cb_admin_edit_repeat_cat(call: CallbackQuery, state: FSMContext):
     await call.answer()
 
 
-@router.message(AdminState.entering_repeat_days)
+@router.message(AdminState.entering_repeat_days, _ADMIN_MSG_FILTER)
 async def process_new_repeat_days(message: Message, state: FSMContext):
     if not await check_admin(message.from_user.id):
         return
     if not message.text or not message.text.strip().isdigit():
-        await message.answer("⚠️ Пожалуйста, введите целое положительное число дней.")
+        await message.answer("⚠️ Пожалуйста, введите целое число дней (от 1 до 365).")
         return
 
     days = int(message.text.strip())
+    if days < 1 or days > 365:
+        await message.answer("⚠️ Пожалуйста, укажите интервал от 1 до 365 дней.")
+        return
+
     data = await state.get_data()
-    cat_id = data["edit_cat_id"]
+    cat_id = data.get("edit_cat_id")
+    if not cat_id:
+        await state.clear()
+        await message.answer("🔄 Сессия редактирования истекла. Откройте /admin заново.")
+        return
     cat_title = REPEAT_CATEGORIES.get(cat_id, cat_id)
 
     await db.set_repeat_days(cat_id, days)
@@ -1052,7 +1140,7 @@ async def cb_admin_select_segment(call: CallbackQuery, state: FSMContext):
     await call.answer()
 
 
-@router.message(AdminState.entering_broadcast_content)
+@router.message(AdminState.entering_broadcast_content, _ADMIN_MSG_FILTER)
 async def process_broadcast_content(message: Message, state: FSMContext):
     if not await check_admin(message.from_user.id):
         return
@@ -1083,42 +1171,60 @@ async def process_broadcast_content(message: Message, state: FSMContext):
 async def cb_admin_send_broadcast(call: CallbackQuery, state: FSMContext):
     if not await check_admin(call.from_user.id):
         return
-    data = await state.get_data()
-    recipients = await db.get_users_by_segment(data["segment"])
-    photo_id = data.get("bc_photo")
-    text = data.get("bc_text", "")
+    admin_id = call.from_user.id
+    if admin_id in _pending_broadcasts:
+        await call.answer("⏳ Рассылка уже выполняется...", show_alert=False)
+        return
 
-    await state.clear()
-    await call.message.edit_text(f"⏳ Отправка рассылки ({len(recipients)} получателей)...")
+    _pending_broadcasts.add(admin_id)
+    try:
+        data = await state.get_data()
+        segment = data.get("segment")
+        if not segment:
+            await state.clear()
+            await call.answer("🔄 Сессия рассылки устарела.", show_alert=True)
+            return
 
-    sent, failed = 0, 0
-    for uid in recipients:
+        recipients = await db.get_users_by_segment(segment)
+        photo_id = data.get("bc_photo")
+        text = data.get("bc_text", "")
+
+        await state.clear()
+        await call.answer()
         try:
-            if photo_id:
-                await call.bot.send_photo(chat_id=uid, photo=photo_id, caption=text[:1024], reply_markup=ikb.repeat_booking_kb())
-            else:
-                await call.bot.send_message(chat_id=uid, text=text[:4096], reply_markup=ikb.repeat_booking_kb())
-            sent += 1
-        except TelegramRetryAfter as e:
-            await asyncio.sleep(e.retry_after)
+            await call.message.edit_text(f"⏳ Отправка рассылки ({len(recipients)} получателей)...")
+        except Exception:
+            pass
+
+        sent, failed = 0, 0
+        for uid in recipients:
             try:
                 if photo_id:
                     await call.bot.send_photo(chat_id=uid, photo=photo_id, caption=text[:1024], reply_markup=ikb.repeat_booking_kb())
                 else:
                     await call.bot.send_message(chat_id=uid, text=text[:4096], reply_markup=ikb.repeat_booking_kb())
                 sent += 1
+            except TelegramRetryAfter as e:
+                await asyncio.sleep(e.retry_after)
+                try:
+                    if photo_id:
+                        await call.bot.send_photo(chat_id=uid, photo=photo_id, caption=text[:1024], reply_markup=ikb.repeat_booking_kb())
+                    else:
+                        await call.bot.send_message(chat_id=uid, text=text[:4096], reply_markup=ikb.repeat_booking_kb())
+                    sent += 1
+                except Exception:
+                    failed += 1
             except Exception:
                 failed += 1
-        except Exception:
-            failed += 1
-        await asyncio.sleep(0.05)
+            await asyncio.sleep(0.05)
 
-    _, unread = await build_admin_dashboard_text()
-    await call.message.answer(
-        f"✨ **Рассылка завершена!**\n"
-        f"────────────────────\n"
-        f"Успешно доставлено: **{sent}** | Ошибок: **{failed}**",
-        reply_markup=ikb.admin_main_kb(unread),
-        parse_mode="Markdown"
-    )
-    await call.answer()
+        _, unread = await build_admin_dashboard_text()
+        await call.message.answer(
+            f"✨ **Рассылка завершена!**\n"
+            f"────────────────────\n"
+            f"Успешно доставлено: **{sent}** | Ошибок: **{failed}**",
+            reply_markup=ikb.admin_main_kb(unread),
+            parse_mode="Markdown"
+        )
+    finally:
+        _pending_broadcasts.discard(admin_id)

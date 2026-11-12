@@ -12,6 +12,9 @@ env/
 *.db-shm
 *.sqlite3
 
+# Бэкапы базы данных на сервере
+backups/
+
 # Кэш Python
 __pycache__/
 *.py[cod]
@@ -24,3 +27,4 @@ __pycache__/
 # Логи и временные файлы
 *.log
 saharvosk_catalog.txt
+

@@ -3,6 +3,7 @@ import logging
 from aiogram import Bot, Dispatcher
 from config import BOT_TOKEN
 from database.db import init_db
+from services import yclients_api
 from services.scheduler import scheduler, restore_all_reminders
 from handlers.common import router as common_router
 from handlers.booking import router as booking_router
@@ -28,8 +29,13 @@ async def main():
     await restore_all_reminders(bot)
 
     print("Админ-панель и планировщик активны. Бот слушает команды...")
-    await bot.delete_webhook(drop_pending_updates=True)
-    await dp.start_polling(bot)
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+        await dp.start_polling(bot)
+    finally:
+        if scheduler.running:
+            scheduler.shutdown(wait=False)
+        await yclients_api.close_http_session()
 
 
 if __name__ == "__main__":
