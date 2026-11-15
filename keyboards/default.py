@@ -2,6 +2,7 @@ from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 
 MAIN_MENU_BUTTONS = {
     "💅 Записаться онлайн",
+    "🔄 Повторить прошлый визит",
     "📋 Мои записи",
     "💰 Услуги и прайс",
     "🎁 Акции",
@@ -9,13 +10,16 @@ MAIN_MENU_BUTTONS = {
     "💬 Связаться с администратором"
 }
 
-def get_main_keyboard() -> ReplyKeyboardMarkup:
-    keyboard = [
-        [KeyboardButton(text="💅 Записаться онлайн")],
-        [KeyboardButton(text="📋 Мои записи"), KeyboardButton(text="💰 Услуги и прайс")],
-        [KeyboardButton(text="🎁 Акции"), KeyboardButton(text="📍 Адреса и контакты")],
-        [KeyboardButton(text="💬 Связаться с администратором")]
-    ]
+def get_main_keyboard(has_past_visit: bool = False) -> ReplyKeyboardMarkup:
+    keyboard = []
+    if has_past_visit:
+        keyboard.append([KeyboardButton(text="🔄 Повторить прошлый визит")])
+        keyboard.append([KeyboardButton(text="💅 Записаться онлайн")])
+    else:
+        keyboard.append([KeyboardButton(text="💅 Записаться онлайн")])
+    keyboard.append([KeyboardButton(text="📋 Мои записи"), KeyboardButton(text="💰 Услуги и прайс")])
+    keyboard.append([KeyboardButton(text="🎁 Акции"), KeyboardButton(text="📍 Адреса и контакты")])
+    keyboard.append([KeyboardButton(text="💬 Связаться с администратором")])
     return ReplyKeyboardMarkup(
         keyboard=keyboard,
         resize_keyboard=True,

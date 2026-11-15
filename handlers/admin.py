@@ -1,6 +1,6 @@
 import asyncio
 import html
-from datetime import date
+from datetime import date, timedelta
 from aiogram import Router, F, Bot
 from aiogram.filters import Command, StateFilter
 from aiogram.types import Message, CallbackQuery, BufferedInputFile, InlineKeyboardMarkup, InlineKeyboardButton
@@ -281,6 +281,25 @@ async def cb_admin_sync_yclients(call: CallbackQuery):
             f"✕ **Ошибка синхронизации:** `{err_safe}`\n\n" + dash_text,
             reply_markup=ikb.admin_main_kb(unread)
         )
+
+
+@router.callback_query(F.data == "adm:digest")
+async def cb_admin_digest(call: CallbackQuery):
+    if not await check_admin(call.from_user.id):
+        await call.answer("Доступ ограничен.", show_alert=True)
+        return
+
+    now = db.now_msk()
+    end_date = now.date().isoformat()
+    start_date = (now.date() - timedelta(days=7)).isoformat()
+
+    text = await db.build_management_digest_text(start_date=start_date, end_date=end_date, is_weekly=False)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Обновить сводку", callback_data="adm:digest")],
+        [InlineKeyboardButton(text="◀️ В панель управления", callback_data="adm:home")]
+    ])
+    await _safe_admin_edit_md(call.message, text, reply_markup=kb)
+    await call.answer()
 
 
 @router.callback_query(F.data == "adm:export_catalog")
@@ -813,6 +832,9 @@ async def cb_admin_preview_step(call: CallbackQuery):
         total_pages=2,
         days=28,
         stars="⭐️⭐️⭐️⭐️⭐️",
+        reason="Специалист Анна больше не выполняет данный набор услуг в этой студии.",
+        reason_text="была перенесена",
+        upsell_block="💡 **Рекомендуем дополнить ваш визит:**\n*(быстрое добавление в 1 клик кнопками ниже)*\n\n",
         hint=""
     )
 

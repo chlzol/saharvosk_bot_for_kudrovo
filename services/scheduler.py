@@ -1,6 +1,8 @@
 import logging
 from datetime import datetime, date, timedelta, timezone
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
+from config import ADMIN_IDS
 from aiogram import Bot
 
 from database import db
@@ -198,7 +200,43 @@ async def schedule_appointment_reminders(bot: Bot, appointment_id: int):
         )
 
 
+async def send_weekly_digest_job(bot: Bot):
+    """Автоматическая рассылка еженедельного дайджеста по понедельникам в 10:00 МСК."""
+    logging.info("Формирование и рассылка еженедельного управленческого дайджеста Sahar&Vosk...")
+    now = now_msk()
+    days_since_monday = now.weekday() + 7
+    prev_monday = (now - timedelta(days=days_since_monday)).date()
+    prev_sunday = prev_monday + timedelta(days=6)
+
+    start_date = prev_monday.isoformat()
+    end_date = prev_sunday.isoformat()
+
+    text = await db.build_management_digest_text(start_date=start_date, end_date=end_date, is_weekly=True)
+    all_admins = await db.get_all_admin_ids(ADMIN_IDS)
+
+    for admin_id in all_admins:
+        try:
+            await bot.send_message(
+                chat_id=admin_id,
+                text=text[:4096],
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            logging.warning(f"Не удалось доставить еженедельный дайджест администратору {admin_id}: {e}")
+
+
+def schedule_weekly_digest_cron(bot: Bot):
+    scheduler.add_job(
+        send_weekly_digest_job,
+        trigger=CronTrigger(day_of_week="mon", hour=10, minute=0, timezone=MSK_TZ),
+        args=[bot],
+        id="weekly_management_digest",
+        replace_existing=True
+    )
+
+
 async def restore_all_reminders(bot: Bot):
+    schedule_weekly_digest_cron(bot)
     apps = await db.get_appointments_for_scheduler()
     for app in apps:
         await schedule_appointment_reminders(bot, app["id"])

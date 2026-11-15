@@ -75,9 +75,14 @@ def _get_name_prompt_kb(suggested_name: str | None) -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True, one_time_keyboard=True)
 
 
+_confirming_appointments: set[int] = set()
+_active_cart_ops: set[int] = set()
+_active_repeat_ops: set[int] = set()
+
+
 async def _safe_edit_message(call: CallbackQuery, text: str, reply_markup=None):
-    msg = call.message
-    if msg.photo:
+    msg = getattr(call, "message", call)
+    if getattr(msg, "photo", None):
         try:
             await msg.delete()
         except Exception:
@@ -518,10 +523,11 @@ async def show_my_appointments(message: Message, state: FSMContext):
     await state.clear()
     appointments = await db.get_user_active_appointments(message.from_user.id)
     if not appointments:
+        has_past = await db.has_completed_appointments(message.from_user.id)
         await db.render_step(
             message,
             "my_apps_empty",
-            reply_markup=ikb.repeat_booking_kb()
+            reply_markup=ikb.repeat_booking_kb(has_past_visit=has_past)
         )
         return
 
@@ -566,31 +572,89 @@ async def show_my_appointments(message: Message, state: FSMContext):
 @router.callback_query(F.data.startswith("confirm_visit:"))
 async def confirm_user_visit(call: CallbackQuery):
     app_id = int(call.data.split(":")[1])
-    app = await db.get_appointment_by_id(app_id)
-    if not app:
-        await call.answer("Запись не найдена или уже была отменена.", show_alert=True)
+    if app_id in _confirming_appointments:
+        await call.answer("Запрос обрабатывается...", show_alert=False)
         return
-    if app["telegram_id"] != call.from_user.id:
-        await call.answer("⛔️ Вы не можете подтвердить чужую запись.", show_alert=True)
-        return
+    _confirming_appointments.add(app_id)
+    try:
+        app = await db.get_appointment_by_id(app_id)
+        if not app:
+            await call.answer("Запись не найдена или уже была отменена.", show_alert=True)
+            return
+        if app["telegram_id"] != call.from_user.id:
+            await call.answer("⛔️ Вы не можете подтвердить чужую запись.", show_alert=True)
+            return
 
-    success = await db.confirm_appointment_visit(app_id, call.from_user.id)
-    if success:
+        now_str = db.now_msk().strftime("%Y-%m-%d %H:%M")
+        app_dt_str = f"{app['visit_date']} {app['visit_time']}"
+        if app_dt_str < now_str or app.get("status") != "active":
+            await call.answer("Запись уже неактуальна или время визита уже прошло.", show_alert=True)
+            return
+
+        if app.get("confirmed") == 1:
+            await call.answer("Визит уже был подтверждён ранее ✨")
+            return
+
+        # Синхронизация с YCLIENTS CRM
+        yc_status, yc_err = await yclients_api.confirm_yclients_record(
+            branch_id=app["branch_id"],
+            yclients_record_id=app.get("yclients_record_id"),
+            expected_date=app["visit_date"],
+            expected_time=app["visit_time"]
+        )
+
+        if yc_status in ("cancelled", "rescheduled"):
+            if yc_status == "rescheduled":
+                await db.admin_reschedule_appointment(app_id)
+            else:
+                await db.admin_cancel_appointment(app_id)
+            remove_appointment_reminders(app_id)
+            reason_text = "была перенесена" if yc_status == "rescheduled" else "была отменена"
+            await db.render_step(
+                call,
+                "confirm_record_outdated",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="💅 Записаться онлайн", callback_data="start_new_booking")]
+                ]),
+                appointment_id=app_id,
+                reason_text=reason_text,
+                branch_title=app.get("branch_title", "")
+            )
+            await call.answer("Запись уже неактуальна.", show_alert=True)
+            return
+
+        success = await db.confirm_appointment_visit(app_id, call.from_user.id)
+        if not success:
+            await call.answer("Запись не найдена или уже была отменена.", show_alert=True)
+            return
+
+        # Для гостя подтверждение всегда проходит успешно и без технических ошибок
         await _safe_edit_message(
             call,
             f"✨ **Ваш визит №{app_id} подтверждён!**\n"
             "────────────────────\n"
             "С нетерпением ждём вас в студии **Sahar&Vosk** 🤍"
         )
+        await call.answer("Визит подтверждён! ✨")
+
+        # Формируем отчёт для администраторов в зависимости от ответа YCLIENTS
+        if yc_status == "api_error":
+            crm_note = (
+                "\n\n⚠️ **Внимание администраторам:** сбой связи с сервером YCLIENTS.\n"
+                "Пожалуйста, проверьте и проставьте статус «Подтверждён» в журнале CRM вручную!"
+            )
+        else:
+            crm_note = "\n✅ Статус в CRM-журнале YCLIENTS: подтверждён (автоматически)"
+
         await notify_admins(
             call.bot,
             f"✓ **Клиент подтвердил визит · Sahar&Vosk**\n"
             f"Запись №{app_id} — {escape_md(app['client_name'])} (`{app['phone']}`)\n"
             f"📍 {escape_md(app['branch_title'])} · {app['visit_date']} в {app['visit_time']}"
+            f"{crm_note}"
         )
-        await call.answer("Визит подтверждён!")
-    else:
-        await call.answer("Запись не найдена или уже была отменена.", show_alert=True)
+    finally:
+        _confirming_appointments.discard(app_id)
 
 
 @router.callback_query(F.data.startswith("cancel_app:"))
@@ -627,6 +691,186 @@ async def cancel_user_appointment(call: CallbackQuery):
         await call.answer("Запись отменена")
     else:
         await call.answer("Запись уже была отменена или не найдена.", show_alert=True)
+
+
+
+async def process_repeat_last_visit(target: Message | CallbackQuery, state: FSMContext, user_id: int):
+    """Сценарий записи в 2 клика ('Повторить прошлый визит')."""
+    if user_id in _active_repeat_ops:
+        if isinstance(target, CallbackQuery):
+            await target.answer("Загружаем данные...", show_alert=False)
+        return
+    _active_repeat_ops.add(user_id)
+    try:
+        last_app = await db.get_last_completed_appointment(user_id)
+        if not last_app:
+            err_msg = "У вас пока нет завершённых визитов для повтора. Выберите удобную студию для новой записи:"
+            kb = ikb.branches_kb(bs.get_branches())
+            if isinstance(target, CallbackQuery) or (hasattr(target, "message") and hasattr(target, "data")):
+                await target.answer()
+                await _safe_edit_message(target, err_msg, reply_markup=kb)
+            else:
+                await target.answer(err_msg, reply_markup=kb)
+            return
+
+        branch_id = last_app["branch_id"]
+        branch = bs.get_branches().get(branch_id, {})
+        branch_title = branch.get("title", last_app.get("branch_title", branch_id))
+        raw_services = str(last_app.get("service_id", "")).split(",")
+        service_ids = [s.strip() for s in raw_services if s.strip()]
+        master_id = str(last_app.get("master_id", "any"))
+        master_name = last_app.get("master_name", "")
+        phone = last_app.get("phone")
+        client_name = last_app.get("client_name")
+
+        await state.clear()
+
+        # 1. Проверяем, доступны ли все услуги из прошлого визита в каталоге студии
+        valid_services = []
+        for sid in service_ids:
+            srv = bs.get_service_by_id(sid)
+            if srv and bs._service_in_branch(srv, branch_id):
+                valid_services.append(srv)
+
+        if len(valid_services) != len(service_ids) or not valid_services:
+            await state.set_state(BookingState.choosing_category)
+            await state.update_data(branch_id=branch_id, cat_page=1, selected_services=[], is_repeat=True)
+            categories = bs.get_categories_by_branch(branch_id)
+            kb = ikb.categories_kb(categories, page=1, selected_count=0)
+            if isinstance(target, CallbackQuery) or (hasattr(target, "message") and hasattr(target, "data")):
+                await target.answer()
+            await db.render_step(
+                target,
+                "repeat_services_updated",
+                reply_markup=kb,
+                branch_title=branch_title
+            )
+            return
+
+        selected_ids = [str(s["id"]) for s in valid_services]
+        summary = bs.get_cart_summary(selected_ids)
+
+        # 2. Проверяем мастера
+        is_master_specific = (
+            master_id != "any"
+            and master_name
+            and not any(w in master_name.lower() for w in ("любой", "свободный", "специалист"))
+        )
+
+        available_masters = await _resolve_masters_for_services(branch_id, selected_ids)
+        if not available_masters:
+            await state.set_state(BookingState.choosing_category)
+            await state.update_data(branch_id=branch_id, cat_page=1, selected_services=[], is_repeat=True)
+            categories = bs.get_categories_by_branch(branch_id)
+            kb = ikb.categories_kb(categories, page=1, selected_count=0)
+            if isinstance(target, CallbackQuery) or (hasattr(target, "message") and hasattr(target, "data")):
+                await target.answer()
+            await db.render_step(
+                target,
+                "repeat_services_updated",
+                reply_markup=kb,
+                branch_title=branch_title
+            )
+            return
+
+        master_in_staff = any(m["id"] == master_id for m in available_masters) if is_master_specific else False
+
+        # 3. Проверяем свободные окна на ближайшие 2 месяца
+        has_open_slots = False
+        api_dates = None
+        if is_master_specific and master_in_staff:
+            api_dates = await yclients_api.fetch_available_dates(branch_id, master_id, selected_ids)
+            if api_dates is not None:
+                has_open_slots = len(api_dates) > 0
+            else:
+                today = db.now_msk().date()
+                cur_m = bs.get_available_dates_in_month(today.year, today.month)
+                next_m_val = (today.month % 12) + 1
+                next_y_val = today.year + (1 if today.month == 12 else 0)
+                next_m = bs.get_available_dates_in_month(next_y_val, next_m_val)
+                has_open_slots = (len(cur_m) + len(next_m)) > 0
+
+        if not is_master_specific or not master_in_staff or not has_open_slots:
+            await state.set_state(BookingState.choosing_master)
+            await state.update_data(
+                branch_id=branch_id,
+                cat_id=valid_services[0].get("cat_id") or "other",
+                selected_services=selected_ids,
+                service_id=selected_ids[0],
+                client_name=client_name,
+                phone=phone,
+                is_repeat=True,
+                mst_page=1
+            )
+            if is_master_specific and not master_in_staff:
+                reason = f"Специалист **{master_name}** больше не выполняет данный набор услуг в этой студии."
+            elif is_master_specific and not has_open_slots:
+                reason = f"У специалиста **{master_name}** сейчас нет свободных окон для записи на ближайшие 2 месяца."
+            else:
+                reason = "Для повтора визита выберите удобного специалиста:"
+
+            kb = ikb.masters_kb(available_masters, page=1)
+            if isinstance(target, CallbackQuery) or (hasattr(target, "message") and hasattr(target, "data")):
+                await target.answer()
+            await db.render_step(
+                target,
+                "repeat_master_unavailable",
+                reply_markup=kb,
+                branch_title=branch_title,
+                reason=reason,
+                master_name=master_name,
+                services_list=summary["titles_inline"],
+                titles_inline=summary["titles_inline"],
+                total_price=summary["total_price"],
+                total_duration=summary["total_duration"]
+            )
+            return
+
+        # 4. Штатный сценарий повтора: открываем календарь
+        await state.set_state(BookingState.choosing_date)
+        await state.update_data(
+            branch_id=branch_id,
+            cat_id=valid_services[0].get("cat_id") or "other",
+            selected_services=selected_ids,
+            service_id=selected_ids[0],
+            master_id=master_id,
+            master_name=master_name,
+            client_name=client_name,
+            phone=phone,
+            api_available_dates=api_dates,
+            is_repeat=True
+        )
+
+        today = db.now_msk().date()
+        cal_kb = ikb.calendar_kb(today.year, today.month, api_dates=api_dates)
+
+        if isinstance(target, CallbackQuery) or (hasattr(target, "message") and hasattr(target, "data")):
+            await target.answer()
+        await db.render_step(
+            target,
+            "repeat_visit_summary",
+            reply_markup=cal_kb,
+            branch_title=branch_title,
+            services_list=summary["titles_inline"],
+            titles_inline=summary["titles_inline"],
+            master_name=master_name,
+            total_duration=summary["total_duration"],
+            total_price=summary["total_price"]
+        )
+    finally:
+        _active_repeat_ops.discard(user_id)
+
+
+@router.message(F.text == "🔄 Повторить прошлый визит")
+async def msg_repeat_last_visit(message: Message, state: FSMContext):
+    if not await ensure_user_consent(message):
+        return
+    await process_repeat_last_visit(message, state, message.from_user.id)
+
+
+@router.callback_query(F.data == "repeat_last_visit")
+async def cb_repeat_last_visit(call: CallbackQuery, state: FSMContext):
+    await process_repeat_last_visit(call, state, call.from_user.id)
 
 
 @router.callback_query(F.data.startswith("reschedule_app:"))
@@ -674,22 +918,24 @@ async def start_booking(message: Message, state: FSMContext):
     if not await ensure_user_consent(message):
         return
     await state.clear()
+    has_past = await db.has_completed_appointments(message.from_user.id)
     await state.set_state(BookingState.choosing_branch)
     await db.render_step(
         message,
         "step_1_branch",
-        reply_markup=ikb.branches_kb(bs.get_branches())
+        reply_markup=ikb.branches_kb(bs.get_branches(), has_past_visit=has_past)
     )
 
 
 @router.callback_query(F.data == "start_new_booking")
 async def start_booking_inline(call: CallbackQuery, state: FSMContext):
     await state.clear()
+    has_past = await db.has_completed_appointments(call.from_user.id)
     await state.set_state(BookingState.choosing_branch)
     await db.render_step(
         call,
         "step_1_branch",
-        reply_markup=ikb.branches_kb(bs.get_branches())
+        reply_markup=ikb.branches_kb(bs.get_branches(), has_past_visit=has_past)
     )
     await call.answer()
 
@@ -1017,58 +1263,129 @@ async def _render_cart_screen(call: CallbackQuery, state: FSMContext):
     branch = bs.get_branches().get(branch_id, {})
     summary = bs.get_cart_summary(selected_ids)
 
+    # Умные допродажи (Upsell): подбор 1-2 подходящих сопутствующих услуг
+    upsell_services = bs.get_upsell_recommendations(branch_id, selected_ids, max_count=2)
+    upsell_block_str = ""
+    if upsell_services:
+        upsell_step = await db.get_step_content("step_cart_upsell")
+        u_raw = upsell_step["custom_text"] or db.DEFAULT_STEPS.get("step_cart_upsell", {}).get("text", "")
+        u_formatted = db._format_step_text(u_raw, {
+            "branch_title": branch.get("title", branch_id),
+            "total_price": summary["total_price"],
+            "total_duration": summary["total_duration"]
+        })
+        if u_formatted:
+            upsell_block_str = f"{u_formatted.strip()}\n\n"
+
     await state.set_state(BookingState.managing_cart)
     await db.render_step(
         call,
         "step_cart",
-        reply_markup=ikb.cart_kb(summary["services"]),
+        reply_markup=ikb.cart_kb(summary["services"], upsell_services=upsell_services),
         branch_title=branch.get("title", branch_id),
         count=summary["count"],
         services_list=summary["bullet_lines"],
         total_price=summary["total_price"],
-        total_duration=summary["total_duration"]
+        total_duration=summary["total_duration"],
+        upsell_block=upsell_block_str
     )
 
 
-@router.callback_query(F.data.startswith("srv:"))
-async def select_service(call: CallbackQuery, state: FSMContext):
-    data = await _require_state(call, state, "branch_id", "cat_id")
-    if not data:
+@router.callback_query(F.data.startswith("upsell_add:"))
+async def upsell_add_service(call: CallbackQuery, state: FSMContext):
+    """Быстрое добавление рекомендованной сопутствующей услуги в 1 клик."""
+    user_id = getattr(getattr(call, "from_user", None), "id", getattr(call, "user_id", 0))
+    if user_id in _active_cart_ops:
+        await call.answer()
         return
+    _active_cart_ops.add(user_id)
+    try:
+        data = await _require_state(call, state, "branch_id")
+        if not data:
+            return
 
-    service_id = call.data.split(":")[1]
-    branch_id = data["branch_id"]
-    selected_ids = list(data.get("selected_services", []))
+        service_id = call.data.split(":")[1]
+        branch_id = data["branch_id"]
+        selected_ids = list(data.get("selected_services", []))
 
-    if service_id in selected_ids:
-        await call.answer("Эта процедура уже добавлена в ваш список.", show_alert=False)
-        await _render_cart_screen(call, state)
-        return
+        if service_id in selected_ids:
+            await call.answer("Эта процедура уже добавлена в ваш визит ✨", show_alert=False)
+            await _render_cart_screen(call, state)
+            return
 
-    ok, reason = bs.can_combine_services(branch_id, selected_ids, service_id)
-    if not ok:
-        await call.answer(reason, show_alert=True)
-        return
+        ok, reason = bs.can_combine_services(branch_id, selected_ids, service_id)
+        if not ok:
+            await call.answer(reason, show_alert=True)
+            return
 
-    candidate_list = selected_ids + [service_id]
-    if len(candidate_list) > 1:
+        candidate_list = selected_ids + [service_id]
         masters = await _resolve_masters_for_services(branch_id, candidate_list)
         if not masters:
             await call.answer(
-                "⚠️ Эту услугу выполняет другой профильный специалист, поэтому объединить их в один сеанс нельзя.\n\n"
-                "Завершите текущую запись, а затем оформите вторую процедуру отдельно.",
+                "⚠️ Эту услугу выполняет другой специалист, поэтому объединить их в один визит сейчас нельзя.",
                 show_alert=True
             )
             return
 
-    selected_ids.append(service_id)
-    await state.update_data(
-        service_id=selected_ids[0],
-        selected_services=selected_ids,
-        mst_page=1
-    )
-    await _render_cart_screen(call, state)
-    await call.answer("Процедура добавлена ✨")
+        selected_ids.append(service_id)
+        await state.update_data(
+            service_id=selected_ids[0],
+            selected_services=selected_ids,
+            mst_page=1
+        )
+        await call.answer("Добавлено к визиту ✨")
+        await _render_cart_screen(call, state)
+    finally:
+        _active_cart_ops.discard(user_id)
+
+
+@router.callback_query(F.data.startswith("srv:"))
+async def select_service(call: CallbackQuery, state: FSMContext):
+    user_id = getattr(getattr(call, "from_user", None), "id", getattr(call, "user_id", 0))
+    if user_id in _active_cart_ops:
+        await call.answer()
+        return
+    _active_cart_ops.add(user_id)
+    try:
+        data = await _require_state(call, state, "branch_id", "cat_id")
+        if not data:
+            return
+
+        service_id = call.data.split(":")[1]
+        branch_id = data["branch_id"]
+        selected_ids = list(data.get("selected_services", []))
+
+        if service_id in selected_ids:
+            await call.answer("Эта процедура уже добавлена в ваш список.", show_alert=False)
+            await _render_cart_screen(call, state)
+            return
+
+        ok, reason = bs.can_combine_services(branch_id, selected_ids, service_id)
+        if not ok:
+            await call.answer(reason, show_alert=True)
+            return
+
+        candidate_list = selected_ids + [service_id]
+        if len(candidate_list) > 1:
+            masters = await _resolve_masters_for_services(branch_id, candidate_list)
+            if not masters:
+                await call.answer(
+                    "⚠️ Эту услугу выполняет другой профильный специалист, поэтому объединить их в один сеанс нельзя.\n\n"
+                    "Завершите текущую запись, а затем оформите вторую процедуру отдельно.",
+                    show_alert=True
+                )
+                return
+
+        selected_ids.append(service_id)
+        await state.update_data(
+            service_id=selected_ids[0],
+            selected_services=selected_ids,
+            mst_page=1
+        )
+        await _render_cart_screen(call, state)
+        await call.answer("Процедура добавлена ✨")
+    finally:
+        _active_cart_ops.discard(user_id)
 
 
 @router.callback_query(F.data == "cart:open")
@@ -1376,7 +1693,7 @@ async def select_time(call: CallbackQuery, state: FSMContext):
     visit_time = call.data.split(":", 1)[1]
     await state.update_data(visit_time=visit_time)
 
-    if data.get("reschedule_app_id") and data.get("phone") and data.get("client_name"):
+    if (data.get("reschedule_app_id") or data.get("is_repeat")) and data.get("phone") and data.get("client_name"):
         try:
             await call.message.delete()
         except Exception:
@@ -1638,7 +1955,7 @@ async def finalize_booking(call: CallbackQuery, state: FSMContext):
             if old_app_id:
                 old_app = await db.get_appointment_by_id(old_app_id)
                 if old_app and old_app["status"] == "active":
-                    await db.cancel_appointment(old_app_id, uid)
+                    await db.reschedule_appointment(old_app_id, uid)
                     remove_appointment_reminders(old_app_id)
                     await yclients_api.delete_yclients_record(old_app["branch_id"], old_app.get("yclients_record_id"))
 

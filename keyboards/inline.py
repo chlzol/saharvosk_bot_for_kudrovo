@@ -87,11 +87,12 @@ def yandex_review_kb(branch_id: str) -> InlineKeyboardMarkup:
     ])
 
 
-def branches_kb(branches: dict) -> InlineKeyboardMarkup:
-    buttons = [
-        [InlineKeyboardButton(text=f"📍 Sahar&Vosk · {b['title']}", callback_data=f"branch:{b_id}")]
-        for b_id, b in branches.items()
-    ]
+def branches_kb(branches: dict, has_past_visit: bool = False) -> InlineKeyboardMarkup:
+    buttons = []
+    if has_past_visit:
+        buttons.append([InlineKeyboardButton(text="🔄 Повторить прошлый визит", callback_data="repeat_last_visit")])
+    for b_id, b in branches.items():
+        buttons.append([InlineKeyboardButton(text=f"📍 Sahar&Vosk · {b['title']}", callback_data=f"branch:{b_id}")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
@@ -209,12 +210,25 @@ def services_kb(
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-def cart_kb(selected_services: list[dict]) -> InlineKeyboardMarkup:
-    buttons = [
+def cart_kb(selected_services: list[dict], upsell_services: list[dict] | None = None) -> InlineKeyboardMarkup:
+    buttons = []
+
+    # Кнопки быстрых допродаж (Upsell)
+    if upsell_services:
+        for u in upsell_services:
+            short_t = u.get("upsell_title") or u["title"]
+            price_val = u.get("price")
+            price_display = f"{price_val} ₽" if price_val else ""
+            btn_text = f"✨ + {short_t} ({price_display})" if price_display else f"✨ + {short_t}"
+            buttons.append([
+                InlineKeyboardButton(text=btn_text, callback_data=f"upsell_add:{u['id']}")
+            ])
+
+    buttons.extend([
         [InlineKeyboardButton(text="✨ Выбрать специалиста и время ›", callback_data="cart:proceed")],
         [InlineKeyboardButton(text="＋ Добавить услугу из этой категории", callback_data="cart:add_more")],
         [InlineKeyboardButton(text="📂 Добавить услугу из другого раздела", callback_data="cart:add_other_cat")]
-    ]
+    ])
 
     if len(selected_services) > 1:
         for s in selected_services:
@@ -345,10 +359,12 @@ def reminder_24h_kb(appointment_id: int) -> InlineKeyboardMarkup:
     ])
 
 
-def repeat_booking_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✨ Записаться онлайн", callback_data="start_new_booking")]
-    ])
+def repeat_booking_kb(has_past_visit: bool = False) -> InlineKeyboardMarkup:
+    buttons = []
+    if has_past_visit:
+        buttons.append([InlineKeyboardButton(text="🔄 Повторить прошлый визит", callback_data="repeat_last_visit")])
+    buttons.append([InlineKeyboardButton(text="💅 Записаться онлайн", callback_data="start_new_booking")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 def price_branches_kb(branches: dict) -> InlineKeyboardMarkup:
@@ -444,6 +460,7 @@ def admin_main_kb(unread_count: int = 0) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"💬 Диалоги с клиентами{badge}", callback_data="adm:support")],
         [InlineKeyboardButton(text="📋 Активные записи по студиям", callback_data="adm:apps")],
+        [InlineKeyboardButton(text="📊 Управленческий дайджест", callback_data="adm:digest")],
         [InlineKeyboardButton(text="🔄 Синхронизировать с YCLIENTS", callback_data="adm:sync")],
         [InlineKeyboardButton(text="📄 Выгрузить каталог услуг (.txt)", callback_data="adm:export_catalog")],
         [InlineKeyboardButton(text="🎨 Редактор всех шагов, категорий и фото", callback_data="adm:steps")],

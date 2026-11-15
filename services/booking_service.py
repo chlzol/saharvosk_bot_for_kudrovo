@@ -1094,6 +1094,301 @@ def get_cart_summary(service_ids: list[str]) -> dict:
     }
 
 
+def get_service_grade(service: dict) -> str | None:
+    """Определяет уровень квалификации мастера (грейд) для услуги: 'top', 'expert' или None."""
+    cat_id = str(service.get("cat_id", ""))
+    title = (service.get("title") or "").lower()
+    if cat_id in ("14065324", "14065330") or "топ-мастер" in title or "топ мастер" in title:
+        return "top"
+    if cat_id in ("14065322", "14065329") or "мастер-эксперт" in title or "эксперт" in title:
+        return "expert"
+    return None
+
+
+def format_upsell_title(service: dict) -> str:
+    """Генерирует аккуратное короткое название для компактной кнопки допродажи (Upsell)."""
+    title = service.get("title", "")
+    t_lower = title.lower()
+    if "энзимный пилинг" in t_lower:
+        return "Энзимный пилинг"
+    if "подмыш" in t_lower:
+        if "лазер" in t_lower or "shr" in t_lower:
+            return "Подмышки (лазер)"
+        if "шугаринг" in t_lower or "сахар" in t_lower:
+            return "Подмышки (сахар)"
+        if "полимер" in t_lower or "воск" in t_lower:
+            return "Подмышки (воск)"
+        if "skins" in t_lower:
+            return "Подмышки (Skins)"
+        return "Депиляция подмышек"
+    if "укрепление ногтей гелем" in t_lower:
+        return "Укрепление гелем"
+    if "укрепление ногтей акриловой" in t_lower:
+        return "Укрепление пудрой"
+    if "парафиновый spa" in t_lower:
+        return "Холодный парафин"
+    if "простой дизайн" in t_lower or "дизайн 1 ногтя" in t_lower:
+        return "Дизайн 1 ногтя"
+    if "сложный дизайн" in t_lower:
+        return "Сложный дизайн"
+    if "обработка мозоли" in t_lower:
+        return "Обработка мозоли"
+    if "обработка натоптыша" in t_lower:
+        return "Обработка натоптыша"
+    if "обработка трещин" in t_lower:
+        return "Обработка трещин"
+    if "обработка стоп" in t_lower:
+        return "Обработка стоп"
+    if "маска для бровей" in t_lower:
+        return "Маска для бровей"
+    if "ботокс" in t_lower:
+        return "Ботокс ресниц"
+    if "окрашивание ресниц" in t_lower:
+        return "Окрашивание ресниц"
+    if "ламинирование ресниц" in t_lower:
+        return "Ламинирование ресниц"
+    if "кедровая бочка" in t_lower:
+        return "Кедровая бочка"
+    if "альгинатная маска" in t_lower:
+        return "Альгинатная маска"
+    if "массаж лица" in t_lower:
+        return "Массаж лица"
+    return title[:22] + "…" if len(title) > 22 else title
+
+
+def get_upsell_recommendations(branch_id: str, cart_service_ids: list[str], max_count: int = 2) -> list[dict]:
+    """
+    Модуль умных допродаж (Upsell): подбирает 1-2 сопутствующие услуги к корзине гостя
+    с соблюдением 4 строгих критериев:
+    1. Наличие в каталоге выбранного филиала.
+    2. Отсутствие дублей в корзине.
+    3. Совместимость с пулом мастеров (can_combine_services + непустой список мастеров).
+    4. Соответствие квалификации (грейду): Эксперт vs ТОП-мастер.
+    """
+    if not cart_service_ids:
+        return []
+
+    cart_services = [get_service_by_id(sid) for sid in cart_service_ids if get_service_by_id(sid)]
+    if not cart_services:
+        return []
+
+    cart_ids_set = {str(x) for x in cart_service_ids}
+
+    # Флаги уже имеющихся в корзине направлений (семантическая защита от дублей)
+    cart_has_underarms = False
+    cart_has_peeling = False
+    cart_has_strength = False
+    cart_has_paraffin = False
+    cart_has_design = False
+    cart_has_pedic_zone = False
+    cart_has_lash_tint = False
+    cart_has_lash_lami = False
+    cart_has_brow_care = False
+    cart_has_face_massage = False
+    cart_has_cedar_barrel = False
+    cart_has_alginate = False
+
+    # Определение грейда в текущей корзине
+    cart_grade = None
+    for s in cart_services:
+        g = get_service_grade(s)
+        if g:
+            cart_grade = g
+            break
+
+    for s in cart_services:
+        t = (s.get("title") or "").lower()
+        if "подмыш" in t:
+            cart_has_underarms = True
+        if "энзимный пилинг" in t:
+            cart_has_peeling = True
+        if "укрепление ногтей" in t:
+            cart_has_strength = True
+        if "парафиновый spa" in t:
+            cart_has_paraffin = True
+        if "дизайн" in t:
+            cart_has_design = True
+        if any(k in t for k in ("обработка мозоли", "обработка натоптыша", "обработка трещин", "обработка стоп")):
+            cart_has_pedic_zone = True
+        if "окрашивание ресниц" in t:
+            cart_has_lash_tint = True
+        if "ламинирование ресниц" in t:
+            cart_has_lash_lami = True
+        if "маска для бровей" in t or "ботокс" in t:
+            cart_has_brow_care = True
+        if "массаж лица" in t:
+            cart_has_face_massage = True
+        if "кедровая бочка" in t:
+            cart_has_cedar_barrel = True
+        if "альгинатная маска" in t:
+            cart_has_alginate = True
+
+    # Услуги филиала, которых еще нет в корзине
+    branch_services = [
+        s for s in SERVICES.values()
+        if _service_in_branch(s, branch_id) and str(s["id"]) not in cart_ids_set
+    ]
+
+    has_sugar_depil = False
+    has_wax_depil = False
+    has_skins_depil = False
+    has_laser_depil = False
+    has_bikini = False
+    has_legs_arms = False
+    has_manicure = False
+    has_pedicure = False
+    has_brows = False
+    has_massage = False
+
+    for s in cart_services:
+        t = (s.get("title") or "").lower()
+        cat_id = str(s.get("cat_id", ""))
+        main_cats = _match_service_to_main_categories(s)
+
+        is_laser = "лазер" in t or "shr" in t or cat_id == "3977589"
+        is_sugar = "шугаринг" in t or "сахар" in t or cat_id == "14065334"
+        is_wax = any(k in t for k in ("полимер", "воск", "ваксинг")) or cat_id in ("14065318", "14065317")
+        is_skins = "skins" in t or "скинс" in t or cat_id == "14065314"
+
+        if is_laser:
+            has_laser_depil = True
+        if is_sugar:
+            has_sugar_depil = True
+        if is_wax:
+            has_wax_depil = True
+        if is_skins:
+            has_skins_depil = True
+
+        if "бикини" in t:
+            has_bikini = True
+        if any(k in t for k in ("ноги", "руки", "голен", "бедр")):
+            has_legs_arms = True
+
+        if "manicure" in main_cats or "маникюр" in t:
+            has_manicure = True
+        if "pedicure" in main_cats or "педикюр" in t:
+            has_pedicure = True
+        if "brows" in main_cats or "бров" in t:
+            has_brows = True
+        if ("massage" in main_cats or "массаж" in t) and "массаж лица" not in t and "rf-лифтинг" not in t:
+            has_massage = True
+
+    def find_candidates(keywords: list[str], must_keywords: list[str] = None, exclude_keywords: list[str] = None, allowed_cats: list[str] = None) -> list[dict]:
+        res = []
+        for s in branch_services:
+            t = (s.get("title") or "").lower()
+            cat = str(s.get("cat_id", ""))
+            if allowed_cats and cat not in allowed_cats:
+                continue
+            if exclude_keywords and any(ek in t for ek in exclude_keywords):
+                continue
+            if must_keywords and not all(mk in t for mk in must_keywords):
+                continue
+            if keywords and not any(k in t for k in keywords):
+                continue
+            res.append(s)
+        return res
+
+    raw_candidates = []
+
+    # Направление 1 и 2: Депиляция (Бикини / Ноги / Руки)
+    if has_bikini or has_legs_arms or has_sugar_depil or has_wax_depil or has_skins_depil or has_laser_depil:
+        if not cart_has_underarms:
+            underarms = []
+            if has_sugar_depil:
+                underarms = find_candidates(["подмыш"], must_keywords=["шугаринг"], exclude_keywords=["муж"], allowed_cats=["14065334"])
+            elif has_wax_depil:
+                underarms = find_candidates(["подмыш"], must_keywords=["полимер"], exclude_keywords=["муж"], allowed_cats=["14065318"])
+            elif has_skins_depil:
+                underarms = find_candidates(["подмыш"], must_keywords=["skins"], exclude_keywords=["муж"], allowed_cats=["14065314"])
+            elif has_laser_depil:
+                underarms = find_candidates(["подмыш"], must_keywords=["лазерная shr"], exclude_keywords=["муж", "комплекс"], allowed_cats=["3977589"])
+            raw_candidates.extend(underarms)
+
+        if not cart_has_peeling:
+            raw_candidates.extend(find_candidates(["энзимный пилинг"]))
+
+    # Направление 3: Маникюр (Укрепление + SPA/Дизайн)
+    if has_manicure:
+        if not cart_has_strength:
+            raw_candidates.extend(find_candidates(["укрепление ногтей гелем"]))
+        if not cart_has_paraffin:
+            raw_candidates.extend(find_candidates(["парафиновый spa уход для рук"]))
+        if not cart_has_strength:
+            raw_candidates.extend(find_candidates(["укрепление ногтей акриловой"]))
+        if not cart_has_design:
+            raw_candidates.extend(find_candidates(["простой дизайн 1 ногтя", "дизайн 1 ногтя"]))
+
+    # Направление 4: Педикюр (Обработка стоп/зон + SPA)
+    if has_pedicure:
+        if not cart_has_pedic_zone:
+            raw_candidates.extend(find_candidates(["обработка стоп и пяток"]))
+        if not cart_has_paraffin:
+            raw_candidates.extend(find_candidates(["парафиновый spa"]))
+        if not cart_has_pedic_zone:
+            raw_candidates.extend(find_candidates(["обработка натоптыша", "обработка мозоли", "обработка трещин"]))
+
+    # Направление 5: Брови (Ресницы + Уход за бровями)
+    if has_brows:
+        if not cart_has_lash_tint:
+            raw_candidates.extend(find_candidates(["окрашивание ресниц"], exclude_keywords=["комплекс", "ботокс"]))
+        if not cart_has_brow_care:
+            raw_candidates.extend(find_candidates(["маска для бровей"]))
+        if not cart_has_lash_lami:
+            raw_candidates.extend(find_candidates(["ламинирование ресниц"], exclude_keywords=["комплекс", "ботокс"]))
+        if not cart_has_brow_care:
+            raw_candidates.extend(find_candidates(["ламинирование ресниц + ботокс"]))
+
+    # Направление 6: Массаж тела (Лицо + Бочка/Альгинат)
+    if has_massage:
+        if not cart_has_face_massage:
+            raw_candidates.extend(find_candidates(["классический массаж лица 40", "скульптурный массаж лица 40"]))
+        if not cart_has_cedar_barrel:
+            raw_candidates.extend(find_candidates(["кедровая бочка"]))
+        if not cart_has_alginate:
+            raw_candidates.extend(find_candidates(["альгинатная маска 25"]))
+
+    accepted = []
+    seen_titles = set()
+    seen_ids = set()
+
+    for cand in raw_candidates:
+        cand_id = str(cand["id"])
+        if cand_id in seen_ids:
+            continue
+
+        # Критерий 4: Соответствие грейда
+        cand_grade = get_service_grade(cand)
+        if cart_grade == "top" and cand_grade == "expert":
+            continue
+        if cart_grade == "expert" and cand_grade == "top":
+            continue
+
+        u_title = format_upsell_title(cand)
+        if u_title in seen_titles:
+            continue
+
+        # Критерий 3: Совместимость с мастерами
+        can_combine, _ = can_combine_services(branch_id, cart_service_ids, cand_id)
+        if not can_combine:
+            continue
+
+        common_masters = get_masters(branch_id, [str(x) for x in cart_service_ids] + [cand_id])
+        if not common_masters:
+            continue
+
+        cand_copy = dict(cand)
+        cand_copy["upsell_title"] = u_title
+        accepted.append(cand_copy)
+        seen_titles.add(u_title)
+        seen_ids.add(cand_id)
+
+        if len(accepted) >= max_count:
+            break
+
+    return accepted
+
+
 def get_master_name(master_id: str) -> str:
     if str(master_id) == "any":
         return "Любой свободный специалист"

@@ -71,10 +71,11 @@ async def cmd_start(message: Message, state: FSMContext):
     real_name = await db.get_user_real_name(message.from_user.id)
     display_name = real_name or message.from_user.first_name or "Гость"
 
+    has_past = await db.has_completed_appointments(message.from_user.id)
     await db.render_step(
         message,
         "start",
-        reply_markup=get_main_keyboard(),
+        reply_markup=get_main_keyboard(has_past_visit=has_past),
         first_name=display_name
     )
 
@@ -98,10 +99,11 @@ async def cb_accept_consent(call: CallbackQuery, state: FSMContext):
     real_name = await db.get_user_real_name(call.from_user.id)
     display_name = real_name or call.from_user.first_name or "Гость"
 
+    has_past = await db.has_completed_appointments(call.from_user.id)
     await db.render_step(
         call.message,
         "start",
-        reply_markup=get_main_keyboard(),
+        reply_markup=get_main_keyboard(has_past_visit=has_past),
         first_name=display_name
     )
 
@@ -191,9 +193,10 @@ async def select_support_branch(call: CallbackQuery, state: FSMContext):
 )
 async def exit_client_support(message: Message, state: FSMContext):
     await state.clear()
+    has_past = await db.has_completed_appointments(message.from_user.id)
     await message.answer(
         "Вы вернулись в главное меню **Sahar&Vosk**. Ответ администратора поступит прямо в этот чат.",
-        reply_markup=get_main_keyboard(),
+        reply_markup=get_main_keyboard(has_past_visit=has_past),
         parse_mode="Markdown"
     )
 

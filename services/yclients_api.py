@@ -363,3 +363,76 @@ async def delete_yclients_record(branch_id: str, yclients_record_id: str | None)
         logging.error(f"Ошибка при отмене записи в YCLIENTS: {e}")
 
     return False
+
+
+async def confirm_yclients_record(
+    branch_id: str,
+    yclients_record_id: str | None,
+    expected_date: str | None = None,
+    expected_time: str | None = None
+) -> tuple[str, str | None]:
+    """
+    Проверяет актуальность записи в CRM YCLIENTS и передает статус подтверждения (attendance: 2).
+
+    Возвращает (status, error_message):
+    - ("ok", None) — визит успешно подтверждён в журнале YCLIENTS
+    - ("cancelled", message) — запись удалена или отменена в YCLIENTS
+    - ("rescheduled", message) — дата или время записи изменены в YCLIENTS
+    - ("api_error", message) — сервер YCLIENTS недоступен (таймаут, сетевой сбой, HTTP 5xx)
+    """
+    if not USE_YCLIENTS_API or not yclients_record_id or yclients_record_id == "mock_record_id":
+        return "ok", None
+
+    company_id = YCLIENTS_COMPANIES.get(branch_id, 0)
+    if not company_id:
+        return "ok", None
+
+    url = f"{BASE_URL}/record/{company_id}/{yclients_record_id}"
+
+    # 1. Проверяем актуальность и параметры времени записи в CRM-журнале
+    try:
+        session = await get_http_session()
+        async with session.get(url, headers=_get_headers()) as resp:
+            if resp.status == 404:
+                return "cancelled", f"Запись #{yclients_record_id} не найдена в YCLIENTS (404)."
+            if resp.status in (200, 201):
+                resp_json = await resp.json()
+                data = (resp_json.get("data") or {}) if isinstance(resp_json, dict) else {}
+
+                # Проверка флага удаления и статуса отмены/неявки
+                if data.get("deleted") is True or data.get("attendance") == -1 or data.get("visit_attendance") == -1:
+                    return "cancelled", f"Запись #{yclients_record_id} удалена или отменена в журнале YCLIENTS."
+
+                # Проверка переноса даты или времени
+                rec_dt = str(data.get("datetime") or "")
+                if expected_date and expected_date not in rec_dt:
+                    return "rescheduled", f"Дата записи #{yclients_record_id} изменена в YCLIENTS ({rec_dt})."
+                if expected_time:
+                    norm_time = expected_time.zfill(5)
+                    if norm_time not in rec_dt and expected_time not in rec_dt:
+                        return "rescheduled", f"Время записи #{yclients_record_id} изменено в YCLIENTS ({rec_dt})."
+            elif resp.status in (500, 502, 503, 504):
+                logging.warning(f"YCLIENTS GET record #{yclients_record_id} вернул серверную ошибку {resp.status}")
+                return "api_error", f"Серверная ошибка YCLIENTS ({resp.status})"
+            else:
+                logging.warning(f"YCLIENTS GET record #{yclients_record_id} статус {resp.status}")
+                return "api_error", f"Ошибка YCLIENTS ({resp.status})"
+    except Exception as e:
+        logging.error(f"Сетевой сбой при проверке записи #{yclients_record_id} в YCLIENTS: {e}")
+        return "api_error", str(e)
+
+    # 2. Отправляем статус подтверждения визита (attendance: 2)
+    payload = {"attendance": 2}
+    try:
+        session = await get_http_session()
+        async with session.put(url, json=payload, headers=_get_headers()) as resp:
+            if resp.status in (200, 201):
+                logging.info(f"Запись #{yclients_record_id} успешно подтверждена в YCLIENTS (attendance=2).")
+                return "ok", None
+            if resp.status == 404:
+                return "cancelled", f"Запись #{yclients_record_id} не найдена при подтверждении (404)."
+            logging.warning(f"Ошибка ответа YCLIENTS PUT record #{yclients_record_id} ({resp.status}): {await resp.text()}")
+            return "api_error", f"Ошибка сохранения в YCLIENTS ({resp.status})"
+    except Exception as e:
+        logging.error(f"Сетевой сбой при подтверждении записи #{yclients_record_id} в YCLIENTS: {e}")
+        return "api_error", str(e)

@@ -233,9 +233,19 @@ BASE_STEPS = {
             "{services_list}\n\n"
             "────────────────────\n"
             "💳 **Итого:** {total_price}  ·  ⏱ **Длительность:** ~{total_duration} мин.\n\n"
+            "{upsell_block}"
             "Вы можете дополнить визит ещё одной процедурой или перейти к выбору специалиста:"
         ),
-        "hints": "{branch_title}, {count}, {services_list}, {total_price}, {total_duration}"
+        "hints": "{branch_title}, {count}, {services_list}, {total_price}, {total_duration}, {upsell_block}"
+    },
+    "step_cart_upsell": {
+        "group": "booking",
+        "title": "✨ Корзина: Блок рекомендаций (Upsell)",
+        "text": (
+            "💡 **Рекомендуем дополнить ваш визит:**\n"
+            "*(быстрое добавление в 1 клик кнопками ниже)*"
+        ),
+        "hints": "{branch_title}, {total_price}, {total_duration}"
     },
     "step_4_master": {
         "group": "booking",
@@ -324,6 +334,57 @@ BASE_STEPS = {
             "Управлять записью можно в разделе **«📋 Мои записи»**."
         ),
         "hints": "{appointment_id}, {address}, {service_title}, {price}, {master_name}, {formatted_date}, {visit_time}"
+    },
+    "repeat_visit_summary": {
+        "group": "booking",
+        "title": "🔄 Повтор визита: Сводка перед календарём",
+        "text": (
+            "🔄 **Повторить прошлый визит · Sahar&Vosk**\n"
+            "────────────────────\n"
+            "📍 **Студия:** Sahar&Vosk · {branch_title}\n"
+            "✨ **Услуги:** {services_list}\n"
+            "👩‍⚕️ **Специалист:** {master_name}\n"
+            "⏱ **Длительность:** ~{total_duration} мин.\n"
+            "💳 **Стоимость:** {total_price}\n"
+            "────────────────────\n"
+            "Выберите удобную дату визита в календаре ниже 👇"
+        ),
+        "hints": "{branch_title}, {services_list}, {master_name}, {total_duration}, {total_price}"
+    },
+    "repeat_services_updated": {
+        "group": "booking",
+        "title": "⚠️ Повтор визита: Состав услуг обновился",
+        "text": (
+            "ℹ️ **Sahar&Vosk · {branch_title}**\n"
+            "────────────────────\n"
+            "Состав услуг вашего прошлого визита обновился в каталоге студии.\n\n"
+            "Пожалуйста, выберите желаемые процедуры для записи:"
+        ),
+        "hints": "{branch_title}"
+    },
+    "repeat_master_unavailable": {
+        "group": "booking",
+        "title": "👩‍⚕️ Повтор визита: Мастер недоступен или нет окон",
+        "text": (
+            "ℹ️ **Sahar&Vosk · {branch_title}**\n"
+            "────────────────────\n"
+            "{reason}\n\n"
+            "✨ **Выбранные услуги:** {services_list}\n"
+            "💳 **Стоимость:** {total_price}  ·  ⏱ ~{total_duration} мин.\n\n"
+            "Пожалуйста, выберите специалиста:"
+        ),
+        "hints": "{branch_title}, {reason}, {master_name}, {services_list}, {total_price}, {total_duration}"
+    },
+    "confirm_record_outdated": {
+        "group": "booking",
+        "title": "ℹ️ Подтверждение визита: Запись неактуальна в CRM",
+        "text": (
+            "ℹ️ **Запись №{appointment_id} уже неактуальна**\n"
+            "────────────────────\n"
+            "Данная бронь {reason_text} в расписании студии.\n\n"
+            "Вы можете выбрать другое удобное время и оформить новый визит в **Sahar&Vosk**:"
+        ),
+        "hints": "{appointment_id}, {reason_text}, {branch_title}"
     },
 
     # --- ГРУППА 5: НАПОМИНАНИЯ И ОТЗЫВЫ (NPS) ---
@@ -597,6 +658,26 @@ async def init_db():
         """)
         try:
             await db.execute("ALTER TABLE appointments ADD COLUMN duration INTEGER DEFAULT 30;")
+        except Exception:
+            pass
+        try:
+            await db.execute("ALTER TABLE appointments ADD COLUMN confirmed INTEGER DEFAULT 0;")
+        except Exception:
+            pass
+        try:
+            await db.execute("ALTER TABLE appointments ADD COLUMN yclients_record_id TEXT;")
+        except Exception:
+            pass
+        try:
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_appointments_user ON appointments(telegram_id, status);")
+        except Exception:
+            pass
+        try:
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_appointments_date ON appointments(visit_date, status);")
+        except Exception:
+            pass
+        try:
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_appointments_branch ON appointments(branch_id, status);")
         except Exception:
             pass
 
@@ -1060,8 +1141,8 @@ async def render_step(
             await target.answer(text=text[:4096], reply_markup=reply_markup, disable_web_page_preview=True)
         return
 
-    msg = target.message
-    has_old_photo = bool(msg.photo)
+    msg = getattr(target, "message", target)
+    has_old_photo = bool(getattr(msg, "photo", None))
 
     if not force_new and not has_old_photo and not photo_id:
         try:
@@ -1276,6 +1357,7 @@ async def get_appointments_for_scheduler() -> list[dict]:
 
 async def get_appointment_by_id(appointment_id: int) -> dict | None:
     async with _connect() as db:
+        await _archive_past_appointments(db)
         db.row_factory = aiosqlite.Row
         cursor = await db.execute("SELECT * FROM appointments WHERE id = ?", (appointment_id,))
         row = await cursor.fetchone()
@@ -1386,3 +1468,285 @@ async def get_users_by_segment(segment: str) -> list[int]:
 
         rows = await cursor.fetchall()
         return [row[0] for row in rows]
+async def reschedule_appointment(appointment_id: int, telegram_id: int) -> bool:
+    async with _connect() as db:
+        cursor = await db.execute("""
+            UPDATE appointments
+            SET status = 'rescheduled'
+            WHERE id = ? AND telegram_id = ? AND status = 'active'
+        """, (appointment_id, telegram_id))
+        await db.commit()
+        return cursor.rowcount > 0
+
+
+async def admin_reschedule_appointment(appointment_id: int) -> dict | None:
+    app = await get_appointment_by_id(appointment_id)
+    if not app:
+        return None
+    async with _connect() as db:
+        await db.execute("UPDATE appointments SET status = 'rescheduled' WHERE id = ?", (appointment_id,))
+        await db.commit()
+    return app
+
+
+async def get_branch_digest_stats(db: aiosqlite.Connection, branch_id: str | None, start_date: str, end_date: str) -> dict:
+    start_dt = f"{start_date} 00:00:00"
+    end_dt = f"{end_date} 23:59:59.999999"
+
+    # 1. Новые бронирования за период
+    if branch_id:
+        c1 = await db.execute("""
+            SELECT COUNT(*) FROM appointments
+            WHERE REPLACE(created_at, 'T', ' ') BETWEEN ? AND ?
+              AND branch_id = ?
+        """, (start_dt, end_dt, branch_id))
+    else:
+        c1 = await db.execute("""
+            SELECT COUNT(*) FROM appointments
+            WHERE REPLACE(created_at, 'T', ' ') BETWEEN ? AND ?
+        """, (start_dt, end_dt))
+    new_bookings = (await c1.fetchone())[0]
+
+    # 2. Сумма забронированных услуг (без отмененных и перенесенных)
+    if branch_id:
+        c2 = await db.execute("""
+            SELECT COALESCE(SUM(CASE WHEN price > 0 THEN price ELSE 0 END), 0) FROM appointments
+            WHERE REPLACE(created_at, 'T', ' ') BETWEEN ? AND ?
+              AND status NOT IN ('cancelled', 'rescheduled')
+              AND branch_id = ?
+        """, (start_dt, end_dt, branch_id))
+    else:
+        c2 = await db.execute("""
+            SELECT COALESCE(SUM(CASE WHEN price > 0 THEN price ELSE 0 END), 0) FROM appointments
+            WHERE REPLACE(created_at, 'T', ' ') BETWEEN ? AND ?
+              AND status NOT IN ('cancelled', 'rescheduled')
+        """, (start_dt, end_dt))
+    revenue = (await c2.fetchone())[0]
+
+    # 3. Визиты состоялось (completed)
+    if branch_id:
+        c3 = await db.execute("""
+            SELECT COUNT(*) FROM appointments
+            WHERE (visit_date BETWEEN ? AND ? OR REPLACE(created_at, 'T', ' ') BETWEEN ? AND ?)
+              AND status = 'completed'
+              AND branch_id = ?
+        """, (start_date, end_date, start_dt, end_dt, branch_id))
+    else:
+        c3 = await db.execute("""
+            SELECT COUNT(*) FROM appointments
+            WHERE (visit_date BETWEEN ? AND ? OR REPLACE(created_at, 'T', ' ') BETWEEN ? AND ?)
+              AND status = 'completed'
+        """, (start_date, end_date, start_dt, end_dt))
+    completed = (await c3.fetchone())[0]
+
+    # 4. Визиты отменено (cancelled)
+    if branch_id:
+        c4 = await db.execute("""
+            SELECT COUNT(*) FROM appointments
+            WHERE (visit_date BETWEEN ? AND ? OR REPLACE(created_at, 'T', ' ') BETWEEN ? AND ?)
+              AND status = 'cancelled'
+              AND branch_id = ?
+        """, (start_date, end_date, start_dt, end_dt, branch_id))
+    else:
+        c4 = await db.execute("""
+            SELECT COUNT(*) FROM appointments
+            WHERE (visit_date BETWEEN ? AND ? OR REPLACE(created_at, 'T', ' ') BETWEEN ? AND ?)
+              AND status = 'cancelled'
+        """, (start_date, end_date, start_dt, end_dt))
+    cancelled = (await c4.fetchone())[0]
+
+    # 5. Визиты перенесено (rescheduled)
+    if branch_id:
+        c5 = await db.execute("""
+            SELECT COUNT(*) FROM appointments
+            WHERE (visit_date BETWEEN ? AND ? OR REPLACE(created_at, 'T', ' ') BETWEEN ? AND ?)
+              AND status = 'rescheduled'
+              AND branch_id = ?
+        """, (start_date, end_date, start_dt, end_dt, branch_id))
+    else:
+        c5 = await db.execute("""
+            SELECT COUNT(*) FROM appointments
+            WHERE (visit_date BETWEEN ? AND ? OR REPLACE(created_at, 'T', ' ') BETWEEN ? AND ?)
+              AND status = 'rescheduled'
+        """, (start_date, end_date, start_dt, end_dt))
+    rescheduled = (await c5.fetchone())[0]
+
+    # 6. NPS отзывы
+    if branch_id:
+        c6 = await db.execute("""
+            SELECT COUNT(*), AVG(rating) FROM reviews
+            WHERE REPLACE(created_at, 'T', ' ') BETWEEN ? AND ?
+              AND branch_id = ?
+        """, (start_dt, end_dt, branch_id))
+    else:
+        c6 = await db.execute("""
+            SELECT COUNT(*), AVG(rating) FROM reviews
+            WHERE REPLACE(created_at, 'T', ' ') BETWEEN ? AND ?
+        """, (start_dt, end_dt))
+    row6 = await c6.fetchone()
+    reviews_count = row6[0] if row6 else 0
+    avg_rating = round(float(row6[1]), 1) if (row6 and row6[1] is not None) else None
+
+    # 7. Топ-3 специалиста (только для филиалов)
+    top_masters = []
+    if branch_id:
+        cur_rev = await db.execute("""
+            SELECT master_name,
+                   COUNT(*) as total_reviews,
+                   SUM(CASE WHEN rating = 5 THEN 1 ELSE 0 END) as five_stars,
+                   AVG(rating) as avg_rating
+            FROM reviews
+            WHERE REPLACE(created_at, 'T', ' ') BETWEEN ? AND ?
+              AND branch_id = ?
+              AND master_name IS NOT NULL AND master_name != ''
+            GROUP BY master_name
+        """, (start_dt, end_dt, branch_id))
+        rev_rows = await cur_rev.fetchall()
+        rev_by_master = {r[0]: {"total_reviews": r[1], "five_stars": r[2] or 0, "avg_rating": round(float(r[3]), 1) if r[3] else 0.0} for r in rev_rows}
+
+        cur_comp = await db.execute("""
+            SELECT master_name, COUNT(*) as completed_count
+            FROM appointments
+            WHERE (visit_date BETWEEN ? AND ? OR REPLACE(created_at, 'T', ' ') BETWEEN ? AND ?)
+              AND status = 'completed'
+              AND branch_id = ?
+              AND master_name IS NOT NULL AND master_name != ''
+              AND master_id != 'any'
+            GROUP BY master_name
+        """, (start_date, end_date, start_dt, end_dt, branch_id))
+        comp_rows = await cur_comp.fetchall()
+        comp_by_master = {r[0]: r[1] for r in comp_rows}
+
+        all_names = set(rev_by_master.keys()) | set(comp_by_master.keys())
+        filtered_names = []
+        for name in all_names:
+            norm = name.strip().lower()
+            if not norm or "любой" in norm or "свободный" in norm or norm == "any":
+                continue
+            filtered_names.append(name.strip())
+
+        masters_data = []
+        for name in filtered_names:
+            rdata = rev_by_master.get(name, {})
+            c_count = comp_by_master.get(name, 0)
+            f_stars = rdata.get("five_stars", 0)
+            a_rate = rdata.get("avg_rating", 0.0)
+            t_rev = rdata.get("total_reviews", 0)
+            if f_stars > 0 or c_count > 0 or t_rev > 0:
+                masters_data.append({
+                    "name": name,
+                    "five_stars": f_stars,
+                    "completed": c_count,
+                    "avg_rating": a_rate,
+                    "reviews_count": t_rev
+                })
+
+        masters_data.sort(key=lambda m: (m["five_stars"], m["completed"], m["avg_rating"]), reverse=True)
+        top_masters = masters_data[:3]
+
+    return {
+        "new_bookings": new_bookings,
+        "revenue": revenue,
+        "completed": completed,
+        "cancelled": cancelled,
+        "rescheduled": rescheduled,
+        "reviews_count": reviews_count,
+        "avg_rating": avg_rating,
+        "top_masters": top_masters
+    }
+
+
+def _format_revenue_digest(val: int) -> str:
+    if val <= 0:
+        return "0 ₽"
+    return f"{val:,} ₽".replace(",", " ")
+
+
+def _format_nps_digest(avg_rating: float | None, reviews_count: int) -> str:
+    if not reviews_count or avg_rating is None:
+        return "— (нет оценок)"
+    word = "отзыв" if reviews_count % 10 == 1 and reviews_count % 100 != 11 else ("отзыва" if 2 <= reviews_count % 10 <= 4 and not (12 <= reviews_count % 100 <= 14) else "отзывов")
+    return f"**{avg_rating:.1f} ★** ({reviews_count} {word})"
+
+
+async def build_management_digest_text(start_date: str, end_date: str, is_weekly: bool = False) -> str:
+    async with _connect() as db:
+        await _archive_past_appointments(db)
+        prazh = await get_branch_digest_stats(db, "prazhskaya", start_date, end_date)
+        lenin = await get_branch_digest_stats(db, "leningradskaya", start_date, end_date)
+        total = await get_branch_digest_stats(db, None, start_date, end_date)
+
+    start_fmt = date.fromisoformat(start_date).strftime("%d.%m.%Y")
+    end_fmt = date.fromisoformat(end_date).strftime("%d.%m.%Y")
+
+    header_title = "📊 **Еженедельный дайджест · Sahar&Vosk**" if is_weekly else "📊 **Управленческий дайджест · Sahar&Vosk**"
+    period_title = f"🗓 **Календарная неделя:** `{start_fmt} – {end_fmt}`" if is_weekly else f"🗓 **Период (7 дней):** `{start_fmt} – {end_fmt}`"
+
+    def _render_masters(masters: list[dict]) -> str:
+        if not masters:
+            return "  • *нет данных за период*\n"
+        res = []
+        for i, m in enumerate(masters, 1):
+            parts = []
+            if m["five_stars"] > 0:
+                parts.append(f"★ 5.0 ({m['five_stars']} 5★)")
+            elif m["avg_rating"] > 0:
+                parts.append(f"★ {m['avg_rating']:.1f}")
+            if m["completed"] > 0:
+                parts.append(f"{m['completed']} виз.")
+            stats_str = " · ".join(parts) if parts else "активен"
+            res.append(f"  {i}. **{m['name']}** — {stats_str}")
+        return "\n".join(res) + "\n"
+
+    lines = [
+        header_title,
+        period_title,
+        "────────────────────\n",
+        "✨ **Студия · Пражская, 3**",
+        f"• Новых записей через бота: **{prazh['new_bookings']}**",
+        f"• Сумма бронирований: **{_format_revenue_digest(prazh['revenue'])}**",
+        f"• Визиты: состоялось **{prazh['completed']}** · отмен **{prazh['cancelled']}** · переносов **{prazh['rescheduled']}**",
+        f"• Качество сервиса (NPS): {_format_nps_digest(prazh['avg_rating'], prazh['reviews_count'])}",
+        "• Топ-3 специалиста:",
+        _render_masters(prazh["top_masters"]),
+        "────────────────────\n",
+        "✨ **Студия · Ленинградская, 7**",
+        f"• Новых записей через бота: **{lenin['new_bookings']}**",
+        f"• Сумма бронирований: **{_format_revenue_digest(lenin['revenue'])}**",
+        f"• Визиты: состоялось **{lenin['completed']}** · отмен **{lenin['cancelled']}** · переносов **{lenin['rescheduled']}**",
+        f"• Качество сервиса (NPS): {_format_nps_digest(lenin['avg_rating'], lenin['reviews_count'])}",
+        "• Топ-3 специалиста:",
+        _render_masters(lenin["top_masters"]),
+        "────────────────────\n",
+        "🏆 **ИТОГО ПО СЕТИ Sahar&Vosk:**",
+        f"• Всего новых записей: **{total['new_bookings']}**",
+        f"• Общая выручка броней: **{_format_revenue_digest(total['revenue'])}**",
+        f"• Визиты: состоялось **{total['completed']}** · отмен **{total['cancelled']}** · переносов **{total['rescheduled']}**",
+        f"• Средний NPS по сети: {_format_nps_digest(total['avg_rating'], total['reviews_count'])}"
+    ]
+
+    return "\n".join(lines)
+async def get_last_completed_appointment(telegram_id: int) -> dict | None:
+    async with _connect() as db:
+        await _archive_past_appointments(db)
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("""
+            SELECT * FROM appointments
+            WHERE telegram_id = ? AND status = 'completed'
+            ORDER BY visit_date DESC, visit_time DESC, id DESC
+            LIMIT 1
+        """, (telegram_id,))
+        row = await cur.fetchone()
+        return dict(row) if row else None
+
+
+async def has_completed_appointments(telegram_id: int) -> bool:
+    async with _connect() as db:
+        await _archive_past_appointments(db)
+        cur = await db.execute("""
+            SELECT 1 FROM appointments
+            WHERE telegram_id = ? AND status = 'completed'
+            LIMIT 1
+        """, (telegram_id,))
+        row = await cur.fetchone()
+        return row is not None
