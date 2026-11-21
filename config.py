@@ -24,6 +24,17 @@ YCLIENTS_COMPANIES = {
     "leningradskaya": int(os.getenv("YCLIENTS_COMPANY_LENINGRADSKAYA", "0") or 0),
 }
 
+# --- Настройки встроенного HTTP-сервера для приёма вебхуков YCLIENTS ---
+YCLIENTS_WEBHOOK_ENABLED = os.getenv("YCLIENTS_WEBHOOK_ENABLED", "true").lower() == "true"
+YCLIENTS_WEBHOOK_HOST = os.getenv("YCLIENTS_WEBHOOK_HOST", "0.0.0.0")
+YCLIENTS_WEBHOOK_PORT = int(os.getenv("YCLIENTS_WEBHOOK_PORT", "8080"))
+YCLIENTS_WEBHOOK_SECRET = os.getenv("YCLIENTS_WEBHOOK_SECRET", "")
+
+# Обратный маппинг company_id → branch_id для вебхуков
+YCLIENTS_COMPANY_TO_BRANCH: dict[int, str] = {
+    v: k for k, v in YCLIENTS_COMPANIES.items() if v
+}
+
 # ID закрытых групп для архива переписок (можно привязать командой /bind_... прямо в группе)
 ARCHIVE_GROUPS_ENV = {
     "prazhskaya": int(os.getenv("ARCHIVE_GROUP_PRAZHSKAYA", "0") or 0),

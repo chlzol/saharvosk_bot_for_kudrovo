@@ -4,6 +4,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from config import ADMIN_IDS
 from aiogram import Bot
+from aiogram.exceptions import TelegramBadRequest
 
 from database import db
 from services import booking_service as bs
@@ -162,6 +163,7 @@ async def schedule_appointment_reminders(bot: Bot, appointment_id: int):
             run_date=dt_24h,
             args=[bot, appointment_id],
             id=f"rem_24h_{appointment_id}",
+            misfire_grace_time=1800,
             replace_existing=True
         )
 
@@ -173,6 +175,7 @@ async def schedule_appointment_reminders(bot: Bot, appointment_id: int):
             run_date=dt_1h,
             args=[bot, appointment_id],
             id=f"rem_1h_{appointment_id}",
+            misfire_grace_time=1800,
             replace_existing=True
         )
 
@@ -184,6 +187,7 @@ async def schedule_appointment_reminders(bot: Bot, appointment_id: int):
             run_date=dt_after,
             args=[bot, appointment_id],
             id=f"rem_after_{appointment_id}",
+            misfire_grace_time=1800,
             replace_existing=True
         )
 
@@ -196,6 +200,7 @@ async def schedule_appointment_reminders(bot: Bot, appointment_id: int):
             run_date=dt_repeat,
             args=[bot, appointment_id],
             id=f"rem_rep_{appointment_id}",
+            misfire_grace_time=3600,
             replace_existing=True
         )
 
@@ -221,6 +226,14 @@ async def send_weekly_digest_job(bot: Bot):
                 text=text[:4096],
                 parse_mode="Markdown"
             )
+        except TelegramBadRequest:
+            try:
+                await bot.send_message(
+                    chat_id=admin_id,
+                    text=text[:4096]
+                )
+            except Exception as e:
+                logging.warning(f"Не удалось доставить еженедельный дайджест администратору {admin_id}: {e}")
         except Exception as e:
             logging.warning(f"Не удалось доставить еженедельный дайджест администратору {admin_id}: {e}")
 
@@ -231,6 +244,7 @@ def schedule_weekly_digest_cron(bot: Bot):
         trigger=CronTrigger(day_of_week="mon", hour=10, minute=0, timezone=MSK_TZ),
         args=[bot],
         id="weekly_management_digest",
+        misfire_grace_time=3600,
         replace_existing=True
     )
 

@@ -156,7 +156,10 @@ def subcategories_kb(subcategories: dict, page: int = 1, page_size: int = 10, se
 
 def sub2_kb(sub2_options: dict, selected_count: int = 0) -> InlineKeyboardMarkup:
     buttons = [
-        [InlineKeyboardButton(text=title, callback_data=f"sub2:{s2_id}")]
+        [InlineKeyboardButton(
+            text=title if isinstance(title, str) else title.get("title", str(title)),
+            callback_data=f"sub2:{s2_id}"
+        )]
         for s2_id, title in sub2_options.items()
     ]
     if selected_count > 0:
@@ -383,7 +386,10 @@ def price_categories_kb(branch_id: str, categories: dict, page: int = 1, page_si
     current_items = items[start:start + page_size]
 
     buttons = [
-        [InlineKeyboardButton(text=title, callback_data=f"pr_cat:{branch_id}:{c_id}")]
+        [InlineKeyboardButton(
+            text=title if isinstance(title, str) else title.get("title", str(title)),
+            callback_data=f"pr_cat:{branch_id}:{c_id}"
+        )]
         for c_id, title in current_items
     ]
 
@@ -410,7 +416,10 @@ def _short_branch(branch_id: str) -> str:
 def price_subcategories_kb(branch_id: str, main_cat_id: str, subcategories: dict) -> InlineKeyboardMarkup:
     sb = _short_branch(branch_id)
     buttons = [
-        [InlineKeyboardButton(text=title, callback_data=f"ps:{sb}:{main_cat_id}:{sub_id}:1")]
+        [InlineKeyboardButton(
+            text=title if isinstance(title, str) else title.get("title", str(title)),
+            callback_data=f"ps:{sb}:{main_cat_id}:{sub_id}:1"
+        )]
         for sub_id, title in subcategories.items()
     ]
     buttons.append([InlineKeyboardButton(text="‹ К направлениям", callback_data=f"price_br:{branch_id}")])

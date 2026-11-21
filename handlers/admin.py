@@ -1,5 +1,7 @@
 import asyncio
 import html
+import re
+import logging
 from datetime import date, timedelta
 from aiogram import Router, F, Bot
 from aiogram.filters import Command, StateFilter
@@ -165,8 +167,26 @@ async def send_to_archive_group(
                 reply_markup=kb,
                 parse_mode="HTML"
             )
-    except Exception:
-        pass
+    except TelegramBadRequest:
+        try:
+            clean_text = re.sub(r"<[^>]+>", "", full_msg)
+            if photo_id:
+                await bot.send_photo(
+                    chat_id=group_id,
+                    photo=photo_id,
+                    caption=clean_text[:1024],
+                    reply_markup=kb
+                )
+            else:
+                await bot.send_message(
+                    chat_id=group_id,
+                    text=clean_text[:4096],
+                    reply_markup=kb
+                )
+        except Exception as e:
+            logging.warning(f"Ошибка отправки в архивную группу {group_id}: {e}")
+    except Exception as e:
+        logging.warning(f"Ошибка отправки в архивную группу {group_id}: {e}")
 
 
 @router.message(Command("bind_prazhskaya"))
@@ -1048,10 +1068,10 @@ async def cb_admin_cancel_app(call: CallbackQuery):
     except TelegramBadRequest:
         try:
             await call.bot.send_message(chat_id=app["telegram_id"], text=cancel_notice.replace("**", ""))
-        except Exception:
-            pass
-    except Exception:
-        pass
+        except Exception as e:
+            logging.warning(f"Не удалось доставить уведомление об отмене гостю {app['telegram_id']}: {e}")
+    except Exception as e:
+        logging.warning(f"Не удалось доставить уведомление об отмене гостю {app['telegram_id']}: {e}")
 
     await call.answer(f"Запись №{app_id} отменена в боте и в YCLIENTS.", show_alert=True)
     await cb_admin_apps_menu(call)
@@ -1141,6 +1161,8 @@ async def cb_admin_broadcast_start(call: CallbackQuery, state: FSMContext):
 
 @router.callback_query(AdminState.choosing_segment, F.data.startswith("seg:"))
 async def cb_admin_select_segment(call: CallbackQuery, state: FSMContext):
+    if not await check_admin(call.from_user.id):
+        return
     segment = call.data.split(":", 1)[1]
     recipients = await db.get_users_by_segment(segment)
     seg_title = SEGMENT_TITLES.get(segment, segment)

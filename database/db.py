@@ -386,6 +386,54 @@ BASE_STEPS = {
         ),
         "hints": "{appointment_id}, {reason_text}, {branch_title}"
     },
+    "webhook_record_created": {
+        "group": "booking",
+        "title": "📲 Внешняя запись: Карточка визита (телефон / карты)",
+        "text": (
+            "✨ **Ваш визит забронирован · Sahar&Vosk**\n"
+            "────────────────────\n"
+            "📍 **Студия:** Sahar&Vosk · {branch_title}\n"
+            "✨ **Услуги:** {services_list}\n"
+            "👩‍⚕️ **Специалист:** {master_name}\n"
+            "🗓 **Дата и время:** {visit_date} в **{visit_time}**\n"
+            "⏱ **Длительность:** ~{total_duration} мин.\n"
+            "💳 **Стоимость:** {total_price}\n"
+            "📞 **Контакт студии:** `+7 (812) 988-98-53`\n"
+            "────────────────────\n"
+            "Мы зафиксировали вашу запись в расписании студии и напомним о ней за 24 часа и за 1 час до начала.\n"
+            "Вы можете управлять визитом кнопками ниже 👇"
+        ),
+        "hints": "{branch_title}, {visit_date}, {visit_time}, {master_name}, {services_list}, {total_price}, {total_duration}"
+    },
+    "webhook_record_updated": {
+        "group": "booking",
+        "title": "🔄 Внешняя запись: Время или мастер изменены",
+        "text": (
+            "🔄 **Параметры визита обновлены · Sahar&Vosk**\n"
+            "────────────────────\n"
+            "Детали вашей записи были изменены администратором студии:\n\n"
+            "📍 **Студия:** Sahar&Vosk · {branch_title}\n"
+            "✨ **Услуги:** {services_list}\n"
+            "👩‍⚕️ **Специалист:** {master_name}\n"
+            "🗓 **Новая дата и время:** {visit_date} в **{visit_time}**\n"
+            "────────────────────\n"
+            "Все напоминания автоматически обновлены на новое время. Ждём вас! 🤍"
+        ),
+        "hints": "{branch_title}, {visit_date}, {visit_time}, {master_name}, {services_list}"
+    },
+    "webhook_record_cancelled": {
+        "group": "booking",
+        "title": "❌ Внешняя запись: Визит отменён администратором",
+        "text": (
+            "❌ **Визит отменён · Sahar&Vosk**\n"
+            "────────────────────\n"
+            "Ваша запись в студию **Sahar&Vosk · {branch_title}** на **{visit_date}** в **{visit_time}** "
+            "(специалист {master_name}) была отменена в расписании студии.\n\n"
+            "Если у вас возникли вопросы или вы хотите подобрать другое удобное время, "
+            "нажмите **«💅 Записаться онлайн»** или свяжитесь с администратором."
+        ),
+        "hints": "{branch_title}, {visit_date}, {visit_time}, {master_name}"
+    },
 
     # --- ГРУППА 5: НАПОМИНАНИЯ И ОТЗЫВЫ (NPS) ---
     "rem_24h": {
@@ -576,7 +624,7 @@ def get_step_group(step_key: str) -> str:
         return "subcats"
     if step_key.startswith(("rem_", "nps_")):
         return "memos"
-    if step_key.startswith("step_"):
+    if step_key.startswith("step_") or step_key.startswith("webhook_"):
         return "booking"
     return "menu"
 
@@ -599,7 +647,14 @@ def _format_step_text(raw_text: str, kwargs: dict) -> str:
 
 
 def _connect():
-    return aiosqlite.connect(DB_NAME, timeout=15.0)
+    return aiosqlite.connect(DB_NAME, timeout=25.0)
+
+
+async def _fetch_scalar(cur, default=0):
+    row = await cur.fetchone()
+    if row and row[0] is not None:
+        return row[0]
+    return default
 
 
 async def init_db():
@@ -609,7 +664,7 @@ async def init_db():
     async with _connect() as db:
         await db.execute("PRAGMA journal_mode=WAL;")
         await db.execute("PRAGMA synchronous=NORMAL;")
-        await db.execute("PRAGMA busy_timeout=10000;")
+        await db.execute("PRAGMA busy_timeout=25000;")
 
         await db.execute("""
             CREATE TABLE IF NOT EXISTS users (
@@ -666,6 +721,10 @@ async def init_db():
             pass
         try:
             await db.execute("ALTER TABLE appointments ADD COLUMN yclients_record_id TEXT;")
+        except Exception:
+            pass
+        try:
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_appointments_yclients_record_id ON appointments(yclients_record_id);")
         except Exception:
             pass
         try:
@@ -1424,19 +1483,19 @@ async def get_admin_stats() -> dict:
     async with _connect() as db:
         await _archive_past_appointments(db)
         c1 = await db.execute("SELECT COUNT(*) FROM users")
-        total_users = (await c1.fetchone())[0]
+        total_users = await _fetch_scalar(c1, 0)
 
         c2 = await db.execute("SELECT COUNT(*) FROM appointments WHERE status = 'active'")
-        active_apps = (await c2.fetchone())[0]
+        active_apps = await _fetch_scalar(c2, 0)
 
         c3 = await db.execute("SELECT COUNT(*) FROM appointments WHERE status = 'active' AND branch_id = 'prazhskaya'")
-        prazhskaya_apps = (await c3.fetchone())[0]
+        prazhskaya_apps = await _fetch_scalar(c3, 0)
 
         c4 = await db.execute("SELECT COUNT(*) FROM appointments WHERE status = 'active' AND branch_id = 'leningradskaya'")
-        leningradskaya_apps = (await c4.fetchone())[0]
+        leningradskaya_apps = await _fetch_scalar(c4, 0)
 
         c5 = await db.execute("SELECT COUNT(*) FROM support_threads WHERE has_unread = 1")
-        unread_chats = (await c5.fetchone())[0]
+        unread_chats = await _fetch_scalar(c5, 0)
 
         return {
             "total_users": total_users,
@@ -1505,7 +1564,7 @@ async def get_branch_digest_stats(db: aiosqlite.Connection, branch_id: str | Non
             SELECT COUNT(*) FROM appointments
             WHERE REPLACE(created_at, 'T', ' ') BETWEEN ? AND ?
         """, (start_dt, end_dt))
-    new_bookings = (await c1.fetchone())[0]
+    new_bookings = await _fetch_scalar(c1, 0)
 
     # 2. Сумма забронированных услуг (без отмененных и перенесенных)
     if branch_id:
@@ -1521,7 +1580,7 @@ async def get_branch_digest_stats(db: aiosqlite.Connection, branch_id: str | Non
             WHERE REPLACE(created_at, 'T', ' ') BETWEEN ? AND ?
               AND status NOT IN ('cancelled', 'rescheduled')
         """, (start_dt, end_dt))
-    revenue = (await c2.fetchone())[0]
+    revenue = int(await _fetch_scalar(c2, 0))
 
     # 3. Визиты состоялось (completed)
     if branch_id:
@@ -1537,7 +1596,7 @@ async def get_branch_digest_stats(db: aiosqlite.Connection, branch_id: str | Non
             WHERE (visit_date BETWEEN ? AND ? OR REPLACE(created_at, 'T', ' ') BETWEEN ? AND ?)
               AND status = 'completed'
         """, (start_date, end_date, start_dt, end_dt))
-    completed = (await c3.fetchone())[0]
+    completed = await _fetch_scalar(c3, 0)
 
     # 4. Визиты отменено (cancelled)
     if branch_id:
@@ -1553,7 +1612,7 @@ async def get_branch_digest_stats(db: aiosqlite.Connection, branch_id: str | Non
             WHERE (visit_date BETWEEN ? AND ? OR REPLACE(created_at, 'T', ' ') BETWEEN ? AND ?)
               AND status = 'cancelled'
         """, (start_date, end_date, start_dt, end_dt))
-    cancelled = (await c4.fetchone())[0]
+    cancelled = await _fetch_scalar(c4, 0)
 
     # 5. Визиты перенесено (rescheduled)
     if branch_id:
@@ -1569,7 +1628,7 @@ async def get_branch_digest_stats(db: aiosqlite.Connection, branch_id: str | Non
             WHERE (visit_date BETWEEN ? AND ? OR REPLACE(created_at, 'T', ' ') BETWEEN ? AND ?)
               AND status = 'rescheduled'
         """, (start_date, end_date, start_dt, end_dt))
-    rescheduled = (await c5.fetchone())[0]
+    rescheduled = await _fetch_scalar(c5, 0)
 
     # 6. NPS отзывы
     if branch_id:

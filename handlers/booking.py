@@ -1553,6 +1553,7 @@ async def paginate_masters(call: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "back:services")
 async def back_to_services(call: CallbackQuery, state: FSMContext):
+    await call.answer()
     await cart_add_more_same_category(call, state)
 
 
@@ -1851,7 +1852,8 @@ async def finalize_booking(call: CallbackQuery, state: FSMContext):
     if action == "restart":
         await state.clear()
         await state.set_state(BookingState.choosing_branch)
-        await db.render_step(call, "step_1_branch", reply_markup=ikb.branches_kb(bs.get_branches()))
+        has_past = await db.has_completed_appointments(call.from_user.id)
+        await db.render_step(call, "step_1_branch", reply_markup=ikb.branches_kb(bs.get_branches(), has_past_visit=has_past))
         await call.answer()
         return
 
