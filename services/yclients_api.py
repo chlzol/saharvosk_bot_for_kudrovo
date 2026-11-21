@@ -8,7 +8,7 @@ from config import (
     YCLIENTS_COMPANIES
 )
 
-BASE_URL = "https://api.yclients.com/api/v1"
+BASE_URL = "https://api.yclients.ru/api/v1"
 MSK_TZ = timezone(timedelta(hours=3))
 
 _http_session: aiohttp.ClientSession | None = None

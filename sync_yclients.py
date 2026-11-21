@@ -12,7 +12,7 @@ from services import booking_service as bs
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-BASE_URL = "https://api.yclients.com/api/v1"
+BASE_URL = "https://api.yclients.ru/api/v1"
 
 
 def _get_headers() -> dict:

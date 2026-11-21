@@ -43,14 +43,14 @@ else
 fi
 
 # 4.2 YCLIENTS API v1
-YC_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 8 https://api.yclients.com/api/v1 || echo "000")
+YC_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 8 https://api.yclients.ru/api/v1 || echo "000")
 if [ "$YC_STATUS" == "200" ] || [ "$YC_STATUS" == "401" ] || [ "$YC_STATUS" == "403" ]; then
     echo "✓ YCLIENTS API шлюз доступен (HTTP статус: ${YC_STATUS})"
     if [ "$YC_STATUS" == "403" ]; then
         echo "ℹ️ Примечание: статус 403 от Cloudflare/YCLIENTS может означать необходимость белых заголовков или партнерского токена."
     fi
 elif [ "$YC_STATUS" == "000" ]; then
-    echo "❌ ОШИБКА: Сервер не может достучаться до api.yclients.com. Возможна блокировка на уровне дата-центра."
+    echo "❌ ОШИБКА: Сервер не может достучаться до api.yclients.ru. Возможна блокировка на уровне дата-центра."
 else
     echo "✓ YCLIENTS API вернул HTTP статус: ${YC_STATUS}"
 fi
