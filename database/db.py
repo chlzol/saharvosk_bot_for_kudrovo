@@ -1,8 +1,9 @@
+import re
 import aiosqlite
 from contextlib import asynccontextmanager
 from datetime import datetime, date, timedelta, timezone
 from aiogram.types import Message, CallbackQuery
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from config import ARCHIVE_GROUPS_ENV
 from services import booking_service as bs
 
@@ -12,6 +13,27 @@ MSK_TZ = timezone(timedelta(hours=3))
 
 def now_msk() -> datetime:
     return datetime.now(MSK_TZ).replace(tzinfo=None)
+
+
+def normalize_client_phone(raw: str | None) -> str:
+    """
+    Приводит телефон к международному формату +7XXXXXXXXXX (из 8999..., 7999...,
+    +7 (999) ..., 999...). Для нероссийских международных номеров с '+' и длиной
+    11–15 цифр сохраняет '+<digits>'. Возвращает '' для некорректного номера.
+    """
+    if not raw:
+        return ""
+    raw_str = str(raw).strip()
+    digits = re.sub(r"\D", "", raw_str)
+    if len(digits) < 10:
+        return ""
+    if len(digits) == 10:
+        return f"+7{digits}"
+    if len(digits) == 11 and digits[0] in ("7", "8"):
+        return f"+7{digits[1:]}"
+    if raw_str.startswith("+") and 11 <= len(digits) <= 15:
+        return f"+{digits}"
+    return f"+7{digits[-10:]}"
 
 
 DEFAULT_REPEAT_DAYS = {
@@ -467,6 +489,33 @@ BASE_STEPS = {
         ),
         "hints": "{address}, {service_title}, {master_name}, {visit_time}, {branch_title}"
     },
+    "max_rem_24h": {
+        "group": "memos",
+        "title": "💬 MAX: Напоминание за 24 часа до визита",
+        "text": (
+            "Напоминание о визите · Sahar&Vosk\n\n"
+            "Здравствуйте, {client_name}! Ждём вас завтра в нашей студии:\n\n"
+            "Локация: Sahar&Vosk · {branch_title} ({address})\n"
+            "Услуги: {service_title}\n"
+            "Специалист: {master_name}\n"
+            "Дата и время: {visit_date} в {visit_time}\n\n"
+            "Если планы изменятся, пожалуйста, сообщите нам заранее. До встречи!"
+        ),
+        "hints": "{client_name}, {branch_title}, {address}, {service_title}, {master_name}, {visit_date}, {visit_time}"
+    },
+    "max_rem_1h": {
+        "group": "memos",
+        "title": "💬 MAX: Напоминание за 1 час до визита",
+        "text": (
+            "Скоро начнётся ваш визит · Sahar&Vosk\n\n"
+            "{client_name}, ждём вас сегодня в {visit_time} (через 1 час):\n\n"
+            "Локация: Sahar&Vosk · {branch_title} ({address})\n"
+            "Услуги: {service_title}\n"
+            "Специалист: {master_name}\n\n"
+            "До скорой встречи!"
+        ),
+        "hints": "{client_name}, {branch_title}, {address}, {service_title}, {master_name}, {visit_date}, {visit_time}"
+    },
     "rem_repeat": {
         "group": "memos",
         "title": "✨ Приглашение на повторный визит",
@@ -623,7 +672,7 @@ def get_step_group(step_key: str) -> str:
         return "cats"
     if step_key.startswith("sc_") or step_key.startswith("s2_"):
         return "subcats"
-    if step_key.startswith(("rem_", "nps_")):
+    if step_key.startswith(("rem_", "nps_", "max_")):
         return "memos"
     if step_key.startswith("step_") or step_key.startswith(("webhook_", "repeat_", "confirm_")):
         return "booking"
@@ -695,6 +744,71 @@ async def _fetch_scalar(cur, default=0):
     return default
 
 
+async def _migrate_appointments_nullable_telegram_id(db: aiosqlite.Connection) -> None:
+    """
+    Если старая БД была создана с NOT NULL или FOREIGN KEY на appointments.telegram_id,
+    безопасно пересобирает таблицу с nullable telegram_id (необходимо для MAX-only записей).
+    """
+    cur_cols = await db.execute("PRAGMA table_info(appointments)")
+    cols_info = await cur_cols.fetchall()
+    if not cols_info:
+        return
+
+    tg_notnull = any(row[1] == "telegram_id" and row[3] == 1 for row in cols_info)
+    cur_fks = await db.execute("PRAGMA foreign_key_list(appointments)")
+    fk_rows = await cur_fks.fetchall()
+    has_user_fk = any(len(row) > 2 and str(row[2]).lower() == "users" for row in fk_rows)
+
+    if not tg_notnull and not has_user_fk:
+        return
+
+    existing_col_names = [row[1] for row in cols_info]
+    target_cols = [
+        "id", "telegram_id", "client_name", "phone", "client_phone",
+        "branch_id", "branch_title", "cat_id", "service_id", "service_title",
+        "price", "duration", "master_id", "master_name", "visit_date",
+        "visit_time", "status", "confirmed", "yclients_record_id", "created_at",
+    ]
+    copy_cols = [c for c in target_cols if c in existing_col_names]
+    cols_sql = ", ".join(copy_cols)
+
+    await db.commit()
+    await db.execute("PRAGMA foreign_keys=OFF;")
+    try:
+        await db.execute("DROP TABLE IF EXISTS appointments_new;")
+        await db.execute("""
+            CREATE TABLE appointments_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                telegram_id INTEGER,
+                client_name TEXT,
+                phone TEXT,
+                client_phone TEXT,
+                branch_id TEXT,
+                branch_title TEXT,
+                cat_id TEXT,
+                service_id TEXT,
+                service_title TEXT,
+                price INTEGER,
+                duration INTEGER DEFAULT 30,
+                master_id TEXT,
+                master_name TEXT,
+                visit_date TEXT,
+                visit_time TEXT,
+                status TEXT DEFAULT 'active',
+                confirmed INTEGER DEFAULT 0,
+                yclients_record_id TEXT,
+                created_at TEXT
+            )
+        """)
+        if copy_cols:
+            await db.execute(f"INSERT INTO appointments_new ({cols_sql}) SELECT {cols_sql} FROM appointments;")
+        await db.execute("DROP TABLE appointments;")
+        await db.execute("ALTER TABLE appointments_new RENAME TO appointments;")
+        await db.commit()
+    finally:
+        await db.execute("PRAGMA foreign_keys=ON;")
+
+
 async def init_db():
     global DEFAULT_STEPS
     DEFAULT_STEPS = build_all_default_steps()
@@ -732,6 +846,7 @@ async def init_db():
                 telegram_id INTEGER,
                 client_name TEXT,
                 phone TEXT,
+                client_phone TEXT,
                 branch_id TEXT,
                 branch_title TEXT,
                 cat_id TEXT,
@@ -762,7 +877,16 @@ async def init_db():
         except Exception:
             pass
         try:
+            await db.execute("ALTER TABLE appointments ADD COLUMN client_phone TEXT;")
+        except Exception:
+            pass
+        await _migrate_appointments_nullable_telegram_id(db)
+        try:
             await db.execute("CREATE INDEX IF NOT EXISTS idx_appointments_yclients_record_id ON appointments(yclients_record_id);")
+        except Exception:
+            pass
+        try:
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_appointments_client_phone ON appointments(client_phone);")
         except Exception:
             pass
         try:
@@ -1191,16 +1315,22 @@ async def render_step_to_chat(
         try:
             await bot.send_photo(chat_id=chat_id, photo=photo_id, caption=text, reply_markup=reply_markup, parse_mode="Markdown")
             return
+        except TelegramForbiddenError:
+            raise
         except TelegramBadRequest:
             try:
                 await bot.send_photo(chat_id=chat_id, photo=photo_id, caption=text, reply_markup=reply_markup)
                 return
+            except TelegramForbiddenError:
+                raise
             except Exception:
                 pass
 
     if photo_id and _utf16_len(text) > 1024:
         try:
             await bot.send_photo(chat_id=chat_id, photo=photo_id)
+        except TelegramForbiddenError:
+            raise
         except Exception:
             pass
 
@@ -1385,30 +1515,39 @@ async def _archive_past_appointments(db: aiosqlite.Connection):
     await db.commit()
 
 
-async def reschedule_and_create_appointment(old_app_id: int | None, telegram_id: int, new_data: dict) -> int:
+async def reschedule_and_create_appointment(old_app_id: int | None, telegram_id: int | None, new_data: dict) -> int:
     now = now_msk().isoformat(timespec="seconds")
     duration = int(new_data.get("duration", 30) or 30)
     norm_time = normalize_time_str(new_data.get("visit_time"))
     yc_rec_id = str(new_data["yclients_record_id"]) if new_data.get("yclients_record_id") is not None else None
+    raw_phone = new_data.get("client_phone") or new_data.get("phone")
+    client_phone = normalize_client_phone(raw_phone) or None
+    raw_tg = new_data.get("telegram_id", telegram_id)
+    try:
+        tg_id_int = int(raw_tg) if raw_tg is not None else None
+        if tg_id_int is not None and tg_id_int <= 0:
+            tg_id_int = None
+    except (ValueError, TypeError):
+        tg_id_int = None
 
     async with _connect() as db:
-        if old_app_id:
+        if old_app_id and tg_id_int:
             await db.execute("""
                 UPDATE appointments
                 SET status = 'rescheduled'
                 WHERE id = ? AND telegram_id = ? AND status = 'active'
-            """, (old_app_id, telegram_id))
+            """, (old_app_id, tg_id_int))
 
         cursor = await db.execute("""
             INSERT INTO appointments (
-                telegram_id, client_name, phone,
+                telegram_id, client_name, phone, client_phone,
                 branch_id, branch_title, cat_id,
                 service_id, service_title, price, duration,
                 master_id, master_name, visit_date, visit_time,
                 status, yclients_record_id, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)
         """, (
-            new_data["telegram_id"], new_data["client_name"], new_data["phone"],
+            tg_id_int, new_data["client_name"], new_data["phone"], client_phone,
             new_data["branch_id"], new_data["branch_title"], new_data["cat_id"],
             new_data["service_id"], new_data["service_title"], new_data["price"], duration,
             new_data["master_id"], new_data["master_name"], new_data["visit_date"], norm_time,
@@ -1416,18 +1555,19 @@ async def reschedule_and_create_appointment(old_app_id: int | None, telegram_id:
         ))
         appointment_id = cursor.lastrowid
 
-        await db.execute("""
-            UPDATE users
-            SET phone = ?, real_name = ?, last_branch_id = ?, last_visit_date = ?
-            WHERE telegram_id = ?
-        """, (new_data["phone"], new_data["client_name"], new_data["branch_id"], new_data["visit_date"], new_data["telegram_id"]))
+        if tg_id_int:
+            await db.execute("""
+                UPDATE users
+                SET phone = ?, real_name = ?, last_branch_id = ?, last_visit_date = ?
+                WHERE telegram_id = ?
+            """, (new_data["phone"], new_data["client_name"], new_data["branch_id"], new_data["visit_date"], tg_id_int))
 
         await db.commit()
         return appointment_id
 
 
 async def create_appointment(data: dict) -> int:
-    return await reschedule_and_create_appointment(None, data["telegram_id"], data)
+    return await reschedule_and_create_appointment(None, data.get("telegram_id"), data)
 
 
 async def get_booked_slots(branch_id: str, master_id: str, visit_date: str) -> list[str]:
@@ -1483,7 +1623,14 @@ async def get_appointments_for_scheduler() -> list[dict]:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute("""
             SELECT * FROM appointments
-            WHERE telegram_id IS NOT NULL AND telegram_id > 0
+            WHERE (
+                (telegram_id IS NOT NULL AND telegram_id > 0)
+                OR (
+                    status = 'active'
+                    AND client_phone IS NOT NULL
+                    AND client_phone != ''
+                )
+            )
               AND (status = 'active'
                OR (status = 'completed' AND visit_date >= ?))
             ORDER BY visit_date ASC, substr('0' || visit_time, -5) ASC, id ASC

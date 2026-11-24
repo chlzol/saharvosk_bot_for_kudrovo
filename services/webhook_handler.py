@@ -14,6 +14,7 @@ from datetime import datetime, date, timedelta, timezone
 import aiosqlite
 from aiogram import Bot
 
+import config
 from config import YCLIENTS_COMPANY_TO_BRANCH
 from database import db
 from services import booking_service as bs
@@ -291,22 +292,45 @@ async def _get_appointment_by_yclients_id(yclients_record_id: str | int) -> dict
 
 
 async def _find_duplicate_appointment(
-    telegram_id: int, branch_id: str, visit_date: str, visit_time: str
+    telegram_id: int | None,
+    branch_id: str,
+    visit_date: str,
+    visit_time: str,
+    client_phone: str | None = None,
 ) -> dict | None:
-    """Ищет существующую активную запись клиента на это же время."""
+    """
+    Ищет существующую активную запись клиента на это же время.
+    Для MAX-only записей (telegram_id IS NULL) избегает ловушки `NULL = NULL` и ищет по client_phone.
+    Также находит существующую MAX-only запись, если клиент позже зарегистрировался в Telegram.
+    """
     norm_time = db.normalize_time_str(visit_time)
+    norm_phone = db.normalize_client_phone(client_phone)
     async with db._connect() as conn:
         conn.row_factory = aiosqlite.Row
-        cur = await conn.execute(
-            """SELECT * FROM appointments
-               WHERE telegram_id = ? AND branch_id = ?
-                 AND visit_date = ? AND substr('0' || visit_time, -5) = ?
-                 AND status = 'active'
-               LIMIT 1""",
-            (telegram_id, branch_id, visit_date, norm_time),
-        )
-        row = await cur.fetchone()
-        return dict(row) if row else None
+        if telegram_id is not None and int(telegram_id) > 0:
+            cur = await conn.execute(
+                """SELECT * FROM appointments
+                   WHERE telegram_id = ? AND branch_id = ?
+                     AND visit_date = ? AND substr('0' || visit_time, -5) = ?
+                     AND status = 'active'
+                   LIMIT 1""",
+                (int(telegram_id), branch_id, visit_date, norm_time),
+            )
+            row = await cur.fetchone()
+            if row:
+                return dict(row)
+        if norm_phone:
+            cur = await conn.execute(
+                """SELECT * FROM appointments
+                   WHERE client_phone = ? AND branch_id = ?
+                     AND visit_date = ? AND substr('0' || visit_time, -5) = ?
+                     AND status = 'active'
+                   LIMIT 1""",
+                (norm_phone, branch_id, visit_date, norm_time),
+            )
+            row = await cur.fetchone()
+            return dict(row) if row else None
+        return None
 
 
 def _is_past_datetime(visit_date: str, visit_time: str) -> bool:
@@ -419,6 +443,7 @@ async def _handle_create(record_data: dict, branch_id: str, bot: Bot):
 
     # 4. Нормализация телефона и поиск пользователя в Telegram-боте
     phone_last10 = normalize_phone(record_data["client_phone"])
+    client_phone_e164 = db.normalize_client_phone(record_data["client_phone"])
     if not phone_last10:
         logger.info(
             "Webhook CREATE: не распознан телефон '%s' для записи #%s",
@@ -429,17 +454,77 @@ async def _handle_create(record_data: dict, branch_id: str, bot: Bot):
 
     user = await find_user_by_phone(phone_last10)
     if not user:
+        if not config.MAX_ENABLED or not client_phone_e164:
+            logger.info(
+                "Webhook CREATE: клиент с телефоном ***%s не зарегистрирован в боте Sahar&Vosk",
+                phone_last10[-4:],
+            )
+            return
+
+        # Клиент без Telegram, но включён мессенджер MAX: сохраняем запись только для напоминаний (без приветственного сообщения)
+        dup_max = await _find_duplicate_appointment(
+            None,
+            branch_id,
+            record_data["visit_date"],
+            record_data["visit_time"],
+            client_phone=client_phone_e164,
+        )
+        if dup_max:
+            logger.info(
+                "Webhook CREATE (MAX): обнаружена существующая запись #%s на то же время для ***%s",
+                dup_max["id"],
+                phone_last10[-4:],
+            )
+            if not dup_max.get("yclients_record_id"):
+                async with db._connect() as conn:
+                    await conn.execute(
+                        "UPDATE appointments SET yclients_record_id = ? WHERE id = ?",
+                        (yclients_record_id, dup_max["id"]),
+                    )
+                    await conn.commit()
+            return
+
+        branch_title = _get_branch_title(branch_id)
+        max_app_data = {
+            "telegram_id": None,
+            "client_name": record_data["client_name"] or "Гость",
+            "phone": client_phone_e164,
+            "client_phone": client_phone_e164,
+            "branch_id": branch_id,
+            "branch_title": branch_title,
+            "cat_id": record_data["cat_id"],
+            "service_id": record_data["service_id"],
+            "service_title": record_data["services_list"],
+            "price": record_data["total_price"],
+            "duration": record_data["total_duration"],
+            "master_id": record_data["master_id"],
+            "master_name": record_data["master_name"],
+            "visit_date": record_data["visit_date"],
+            "visit_time": record_data["visit_time"],
+            "yclients_record_id": yclients_record_id,
+        }
+        appointment_id = await db.create_appointment(max_app_data)
         logger.info(
-            "Webhook CREATE: клиент с телефоном ***%s не зарегистрирован в боте Sahar&Vosk",
+            "Webhook CREATE (MAX): сохранена запись #%s (YCLIENTS #%s) без Telegram для ***%s",
+            appointment_id,
+            yclients_record_id,
             phone_last10[-4:],
         )
+        try:
+            await schedule_appointment_reminders(bot, appointment_id)
+        except Exception as e:
+            logger.error("Webhook (MAX): ошибка постановки напоминаний для записи #%s: %s", appointment_id, e)
         return
 
     telegram_id = user["telegram_id"]
 
-    # 5. Проверка дубля по (telegram_id, branch_id, visit_date, visit_time)
+    # 5. Проверка дубля по (telegram_id, branch_id, visit_date, visit_time) или client_phone
     dup = await _find_duplicate_appointment(
-        telegram_id, branch_id, record_data["visit_date"], record_data["visit_time"]
+        telegram_id,
+        branch_id,
+        record_data["visit_date"],
+        record_data["visit_time"],
+        client_phone=client_phone_e164,
     )
     if dup:
         logger.info(
@@ -447,23 +532,35 @@ async def _handle_create(record_data: dict, branch_id: str, bot: Bot):
             dup["id"],
             telegram_id,
         )
+        dup_updates = {}
         if not dup.get("yclients_record_id"):
+            dup_updates["yclients_record_id"] = yclients_record_id
+        if not dup.get("telegram_id"):
+            dup_updates["telegram_id"] = telegram_id
+        if dup_updates:
             async with db._connect() as conn:
-                await conn.execute(
-                    "UPDATE appointments SET yclients_record_id = ? WHERE id = ?",
-                    (yclients_record_id, dup["id"]),
-                )
+                set_clause = ", ".join(f"{k} = ?" for k in dup_updates)
+                vals = list(dup_updates.values()) + [dup["id"]]
+                await conn.execute(f"UPDATE appointments SET {set_clause} WHERE id = ?", vals)
                 await conn.commit()
+            if "telegram_id" in dup_updates:
+                try:
+                    await schedule_appointment_reminders(bot, dup["id"])
+                except Exception as e:
+                    logger.error("Webhook: ошибка обновления напоминаний #%s: %s", dup["id"], e)
         return
 
     # 6. Сохраняем новую запись в БД
     branch_title = _get_branch_title(branch_id)
     branch_address = _get_branch_address(branch_id)
+    user_phone = user.get("phone") or record_data["client_phone"]
+    client_phone_norm = db.normalize_client_phone(user_phone) or client_phone_e164
 
     app_data = {
         "telegram_id": telegram_id,
         "client_name": record_data["client_name"] or user.get("real_name") or user.get("first_name", "Гость"),
-        "phone": user.get("phone", record_data["client_phone"]),
+        "phone": user_phone,
+        "client_phone": client_phone_norm or None,
         "branch_id": branch_id,
         "branch_title": branch_title,
         "cat_id": record_data["cat_id"],
@@ -573,8 +670,16 @@ async def _handle_update(record_data: dict, branch_id: str, bot: Bot):
     norm_exist_time = db.normalize_time_str(existing["visit_time"])
 
     incoming_phone = record_data.get("client_phone", "").strip()
-    existing_phone = existing.get("phone", "").strip()
+    existing_phone = (existing.get("phone") or existing.get("client_phone") or "").strip()
     phone_changed = bool(incoming_phone) and (normalize_phone(incoming_phone) != normalize_phone(existing_phone))
+
+    existing_tg = existing.get("telegram_id")
+    has_existing_tg = bool(existing_tg is not None and int(existing_tg) > 0)
+    attach_tg_user = None
+    if not phone_changed and not has_existing_tg:
+        lookup_phone = incoming_phone or existing_phone
+        if lookup_phone:
+            attach_tg_user = await find_user_by_phone(lookup_phone)
 
     # Проверяем изменения ключевых полей
     date_changed = record_data["visit_date"] != existing["visit_date"]
@@ -605,6 +710,7 @@ async def _handle_update(record_data: dict, branch_id: str, bot: Bot):
         or attendance_confirmed
         or phone_changed
         or duration_changed
+        or attach_tg_user
     ):
         logger.info("Webhook UPDATE: запись #%s без изменений расписания", existing["id"])
         return
@@ -616,25 +722,51 @@ async def _handle_update(record_data: dict, branch_id: str, bot: Bot):
 
     # Обновляем БД
     update_fields = {}
-    reassigned_to_valid_user = False
+    reassigned_reminder_channel = False
     if phone_changed:
+        norm_incoming_phone = db.normalize_client_phone(incoming_phone)
         new_user = await find_user_by_phone(incoming_phone)
         if new_user:
             update_fields["telegram_id"] = new_user["telegram_id"]
             update_fields["client_name"] = record_data["client_name"] or new_user.get("real_name") or "Гость"
             update_fields["phone"] = incoming_phone
+            update_fields["client_phone"] = db.normalize_client_phone(new_user.get("phone") or incoming_phone) or norm_incoming_phone or None
             existing["telegram_id"] = new_user["telegram_id"]
             existing["phone"] = incoming_phone
-            reassigned_to_valid_user = True
+            existing["client_phone"] = update_fields["client_phone"]
+            reassigned_reminder_channel = True
             logger.info("Webhook UPDATE: запись #%s переписана на клиента telegram_id=%s (тел %s)", existing["id"], new_user["telegram_id"], incoming_phone)
         else:
             update_fields["telegram_id"] = None
             update_fields["client_name"] = record_data["client_name"]
             update_fields["phone"] = incoming_phone
+            update_fields["client_phone"] = norm_incoming_phone or None
             existing["telegram_id"] = None
             existing["phone"] = incoming_phone
+            existing["client_phone"] = update_fields["client_phone"]
             remove_appointment_reminders(existing["id"])
-            logger.info("Webhook UPDATE: запись #%s переписана на незарегистрированный телефон %s, напоминания сняты", existing["id"], incoming_phone)
+            if config.MAX_ENABLED and norm_incoming_phone:
+                reassigned_reminder_channel = True
+                logger.info("Webhook UPDATE (MAX): запись #%s переписана на телефон %s, запланируем напоминания MAX", existing["id"], norm_incoming_phone)
+            else:
+                logger.info("Webhook UPDATE: запись #%s переписана на незарегистрированный телефон %s, напоминания сняты", existing["id"], incoming_phone)
+    else:
+        if attach_tg_user:
+            update_fields["telegram_id"] = attach_tg_user["telegram_id"]
+            if record_data["client_name"] and record_data["client_name"] != "Гость":
+                update_fields["client_name"] = record_data["client_name"]
+            existing["telegram_id"] = attach_tg_user["telegram_id"]
+            reassigned_reminder_channel = True
+            logger.info(
+                "Webhook UPDATE: MAX-only запись #%s привязана к новому Telegram-профилю user=%s",
+                existing["id"],
+                attach_tg_user["telegram_id"],
+            )
+        if not existing.get("client_phone"):
+            backfill_phone = db.normalize_client_phone(incoming_phone or existing.get("phone"))
+            if backfill_phone:
+                update_fields["client_phone"] = backfill_phone
+                existing["client_phone"] = backfill_phone
 
     if attendance_confirmed:
         update_fields["confirmed"] = 1
@@ -666,9 +798,10 @@ async def _handle_update(record_data: dict, branch_id: str, bot: Bot):
 
     logger.info("Webhook UPDATE: запись #%s обновлена: %s", existing["id"], list(update_fields.keys()))
 
-    # Если изменились дата, время или клиент перепривязан — пересоздаём таймеры напоминаний
+    # Если изменились дата, время или канал доставки — пересоздаём таймеры напоминаний
     has_tg = bool(existing.get("telegram_id") and int(existing["telegram_id"]) > 0)
-    if (date_changed or time_changed or reassigned_to_valid_user) and has_tg:
+    has_max = bool(config.MAX_ENABLED and db.normalize_client_phone(existing.get("client_phone") or existing.get("phone")))
+    if (date_changed or time_changed or reassigned_reminder_channel) and (has_tg or has_max):
         try:
             await schedule_appointment_reminders(bot, existing["id"])
         except Exception as e:

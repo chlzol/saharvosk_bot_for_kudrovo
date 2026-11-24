@@ -28,3 +28,6 @@ __pycache__/
 *.log
 saharvosk_catalog.txt
 
+# Сессия мессенджера MAX (личные учётные данные аккаунта)
+max_session*
+

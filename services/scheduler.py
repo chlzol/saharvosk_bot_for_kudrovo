@@ -1,13 +1,16 @@
 import logging
+import re
 from datetime import datetime, date, timedelta, timezone
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+import config
 from config import ADMIN_IDS
 from aiogram import Bot
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 
 from database import db
 from services import booking_service as bs
+from services import max_sender
 from services import yclients_api
 from keyboards import inline as ikb
 
@@ -29,9 +32,106 @@ def _has_valid_telegram_id(app: dict | None) -> bool:
         return False
 
 
-async def _is_appointment_still_valid(app: dict | None, allow_completed: bool = False) -> bool:
+def _get_appointment_phone(app: dict | None) -> str:
+    if not app:
+        return ""
+    return db.normalize_client_phone(app.get("client_phone") or app.get("phone"))
+
+
+def _has_max_delivery(app: dict | None) -> bool:
+    return bool(config.MAX_ENABLED and _get_appointment_phone(app))
+
+
+def _strip_markdown_for_max(text: str) -> str:
+    """Очищает Telegram Markdown-разметку и escape-символы в чистый текст для MAX."""
+    if not text:
+        return ""
+    cleaned = re.sub(
+        r"\[([^\]]+)\]\(([^)]+)\)",
+        lambda m: m.group(2) if m.group(1).strip() == m.group(2).strip() else f"{m.group(1)} ({m.group(2)})",
+        text,
+    )
+    # Защищаем экранированные символы (\*, \_, \`, \[, \], \+, \-, \. и т.д.) до снятия разметки
+    escaped_chars: list[str] = []
+
+    def _stash_escaped(match: re.Match) -> str:
+        idx = len(escaped_chars)
+        escaped_chars.append(match.group(1))
+        return f"\x00ESC{idx}\x00"
+
+    cleaned = re.sub(r"\\([*_`\[\]()~>#+\-=|{}.!\\])", _stash_escaped, cleaned)
+    cleaned = cleaned.replace("```", "")
+    cleaned = re.sub(r"\*\*(.+?)\*\*", r"\1", cleaned, flags=re.DOTALL)
+    cleaned = re.sub(r"__(.+?)__", r"\1", cleaned, flags=re.DOTALL)
+    cleaned = re.sub(r"`([^`]+)`", r"\1", cleaned)
+    cleaned = re.sub(r"(?<!\w)\*([^*\n]+)\*(?!\w)", r"\1", cleaned)
+    cleaned = re.sub(r"(?<!\w)_([^_\n]+)_(?!\w)", r"\1", cleaned)
+    cleaned = cleaned.replace("**", "").replace("`", "")
+
+    for idx, ch_val in enumerate(escaped_chars):
+        cleaned = cleaned.replace(f"\x00ESC{idx}\x00", ch_val)
+    return cleaned.strip()
+
+
+async def _build_max_reminder_text(step_key: str, app: dict, formatted_date: str, address: str) -> str:
+    step = await db.get_step_content(step_key)
+    raw_text = step.get("custom_text") or db.DEFAULT_STEPS.get(step_key, {}).get("text", "")
+    client_name = str(app.get("client_name") or "Гость").strip() or "Гость"
+    rendered = db._format_step_text(
+        raw_text,
+        {
+            "client_name": client_name,
+            "branch_title": app.get("branch_title", ""),
+            "address": address,
+            "visit_date": formatted_date,
+            "formatted_date": formatted_date,
+            "visit_time": app.get("visit_time", ""),
+            "service_title": app.get("service_title", ""),
+            "master_name": app.get("master_name", ""),
+        },
+    )
+    return _strip_markdown_for_max(rendered)
+
+
+async def _maybe_send_max_reminder(
+    bot: Bot,
+    step_key: str,
+    app: dict,
+    formatted_date: str,
+    address: str,
+    has_tg: bool,
+    tg_forbidden: bool,
+) -> None:
+    if not config.MAX_ENABLED:
+        return
+    phone = _get_appointment_phone(app)
+    if not phone:
+        return
+
+    mode = str(config.MAX_MODE or "fallback").strip().lower()
+    should_send = (mode == "both") or (not has_tg) or tg_forbidden
+    if not should_send:
+        return
+
+    try:
+        text = await _build_max_reminder_text(step_key, app, formatted_date, address)
+        await max_sender.send_max_reminder(phone, text, bot=bot)
+    except Exception as e:
+        logging.warning("Ошибка отправки %s MAX-напоминания #%s: %s", step_key, app.get("id"), e)
+
+
+async def _is_appointment_still_valid(
+    app: dict | None,
+    allow_completed: bool = False,
+    allow_max: bool = False,
+) -> bool:
     allowed = ("active", "completed") if allow_completed else ("active",)
-    if not _has_valid_telegram_id(app) or app.get("status") not in allowed:
+    if not app or app.get("status") not in allowed:
+        return False
+
+    has_tg = _has_valid_telegram_id(app)
+    has_max = allow_max and _has_max_delivery(app)
+    if not has_tg and not has_max:
         return False
 
     yc_active = await yclients_api.is_yclients_record_active(
@@ -47,9 +147,11 @@ async def _is_appointment_still_valid(app: dict | None, allow_completed: bool = 
 
 async def send_24h_reminder(bot: Bot, appointment_id: int, force: bool = False):
     app = await db.get_appointment_by_id(appointment_id)
-    if not force and not await _is_appointment_still_valid(app):
+    if not force and not await _is_appointment_still_valid(app, allow_max=True):
         return
-    if not _has_valid_telegram_id(app):
+    has_tg = _has_valid_telegram_id(app)
+    has_max = _has_max_delivery(app)
+    if not has_tg and not has_max:
         return
 
     time_parts = str(app["visit_time"]).split(":")
@@ -64,28 +166,50 @@ async def send_24h_reminder(bot: Bot, appointment_id: int, force: bool = False):
     address = branch.get("address", app["branch_title"])
     is_confirmed = bool(app.get("confirmed") == 1)
 
-    try:
-        await db.render_step_to_chat(
-            bot,
-            chat_id=app["telegram_id"],
-            step_key="rem_24h",
-            reply_markup=ikb.reminder_24h_kb(appointment_id, is_confirmed=is_confirmed),
-            address=address,
-            service_title=app["service_title"],
-            master_name=app["master_name"],
-            formatted_date=formatted_date,
-            visit_time=app["visit_time"],
-            branch_title=app["branch_title"]
-        )
-    except Exception as e:
-        logging.error(f"Ошибка отправки 24ч напоминания #{appointment_id}: {e}")
+    tg_forbidden = False
+    if has_tg:
+        try:
+            await db.render_step_to_chat(
+                bot,
+                chat_id=app["telegram_id"],
+                step_key="rem_24h",
+                reply_markup=ikb.reminder_24h_kb(appointment_id, is_confirmed=is_confirmed),
+                address=address,
+                service_title=app["service_title"],
+                master_name=app["master_name"],
+                formatted_date=formatted_date,
+                visit_time=app["visit_time"],
+                branch_title=app["branch_title"]
+            )
+        except TelegramForbiddenError as e:
+            tg_forbidden = True
+            logging.warning(f"Telegram заблокирован клиентом при 24ч напоминании #{appointment_id}: {e}")
+        except TelegramBadRequest as e:
+            low = str(e).lower()
+            if "blocked" in low or "chat not found" in low or "deactivated" in low:
+                tg_forbidden = True
+            logging.error(f"Ошибка Telegram при отправке 24ч напоминания #{appointment_id}: {e}")
+        except Exception as e:
+            logging.error(f"Ошибка отправки 24ч напоминания #{appointment_id}: {e}")
+
+    await _maybe_send_max_reminder(
+        bot,
+        step_key="max_rem_24h",
+        app=app,
+        formatted_date=formatted_date,
+        address=address,
+        has_tg=has_tg,
+        tg_forbidden=tg_forbidden,
+    )
 
 
 async def send_1h_reminder(bot: Bot, appointment_id: int, force: bool = False):
     app = await db.get_appointment_by_id(appointment_id)
-    if not force and not await _is_appointment_still_valid(app):
+    if not force and not await _is_appointment_still_valid(app, allow_max=True):
         return
-    if not _has_valid_telegram_id(app):
+    has_tg = _has_valid_telegram_id(app)
+    has_max = _has_max_delivery(app)
+    if not has_tg and not has_max:
         return
 
     time_parts = str(app["visit_time"]).split(":")
@@ -96,23 +220,44 @@ async def send_1h_reminder(bot: Bot, appointment_id: int, force: bool = False):
         logging.info(f"Визит #{appointment_id} уже начался или до него осталось менее 15 мин — 1ч напоминание пропущено.")
         return
 
+    formatted_date = date.fromisoformat(app["visit_date"]).strftime("%d.%m.%Y")
     branch = bs.get_branches().get(app["branch_id"], {})
     address = branch.get("address", app["branch_title"])
 
-    try:
-        await db.render_step_to_chat(
-            bot,
-            chat_id=app["telegram_id"],
-            step_key="rem_1h",
-            reply_markup=ikb.branch_route_kb(app["branch_id"]),
-            address=address,
-            service_title=app["service_title"],
-            master_name=app["master_name"],
-            visit_time=app["visit_time"],
-            branch_title=app["branch_title"]
-        )
-    except Exception as e:
-        logging.error(f"Ошибка отправки 1ч напоминания #{appointment_id}: {e}")
+    tg_forbidden = False
+    if has_tg:
+        try:
+            await db.render_step_to_chat(
+                bot,
+                chat_id=app["telegram_id"],
+                step_key="rem_1h",
+                reply_markup=ikb.branch_route_kb(app["branch_id"]),
+                address=address,
+                service_title=app["service_title"],
+                master_name=app["master_name"],
+                visit_time=app["visit_time"],
+                branch_title=app["branch_title"]
+            )
+        except TelegramForbiddenError as e:
+            tg_forbidden = True
+            logging.warning(f"Telegram заблокирован клиентом при 1ч напоминании #{appointment_id}: {e}")
+        except TelegramBadRequest as e:
+            low = str(e).lower()
+            if "blocked" in low or "chat not found" in low or "deactivated" in low:
+                tg_forbidden = True
+            logging.error(f"Ошибка Telegram при отправке 1ч напоминания #{appointment_id}: {e}")
+        except Exception as e:
+            logging.error(f"Ошибка отправки 1ч напоминания #{appointment_id}: {e}")
+
+    await _maybe_send_max_reminder(
+        bot,
+        step_key="max_rem_1h",
+        app=app,
+        formatted_date=formatted_date,
+        address=address,
+        has_tg=has_tg,
+        tg_forbidden=tg_forbidden,
+    )
 
 
 async def send_aftercare_and_nps(bot: Bot, appointment_id: int, force: bool = False):
@@ -186,7 +331,9 @@ async def schedule_appointment_reminders(bot: Bot, appointment_id: int):
     remove_appointment_reminders(appointment_id)
 
     app = await db.get_appointment_by_id(appointment_id)
-    if not _has_valid_telegram_id(app) or app["status"] not in ("active", "completed"):
+    has_tg = _has_valid_telegram_id(app)
+    has_max = _has_max_delivery(app)
+    if not app or app["status"] not in ("active", "completed") or (not has_tg and not has_max):
         return
 
     time_parts = str(app["visit_time"]).split(":")
@@ -195,54 +342,56 @@ async def schedule_appointment_reminders(bot: Bot, appointment_id: int):
     now = now_msk()
     duration_min = int(app.get("duration", 30) or 30)
 
-    dt_24h = visit_dt - timedelta(hours=24)
-    if dt_24h > now:
-        scheduler.add_job(
-            send_24h_reminder,
-            trigger="date",
-            run_date=dt_24h,
-            args=[bot, appointment_id],
-            id=f"rem_24h_{appointment_id}",
-            misfire_grace_time=1800,
-            replace_existing=True
-        )
+    if app["status"] == "active":
+        dt_24h = visit_dt - timedelta(hours=24)
+        if dt_24h > now:
+            scheduler.add_job(
+                send_24h_reminder,
+                trigger="date",
+                run_date=dt_24h,
+                args=[bot, appointment_id],
+                id=f"rem_24h_{appointment_id}",
+                misfire_grace_time=1800,
+                replace_existing=True
+            )
 
-    dt_1h = visit_dt - timedelta(hours=1)
-    if dt_1h > now:
-        scheduler.add_job(
-            send_1h_reminder,
-            trigger="date",
-            run_date=dt_1h,
-            args=[bot, appointment_id],
-            id=f"rem_1h_{appointment_id}",
-            misfire_grace_time=1800,
-            replace_existing=True
-        )
+        dt_1h = visit_dt - timedelta(hours=1)
+        if dt_1h > now:
+            scheduler.add_job(
+                send_1h_reminder,
+                trigger="date",
+                run_date=dt_1h,
+                args=[bot, appointment_id],
+                id=f"rem_1h_{appointment_id}",
+                misfire_grace_time=1800,
+                replace_existing=True
+            )
 
-    dt_after = visit_dt + timedelta(minutes=duration_min)
-    if dt_after > now:
-        scheduler.add_job(
-            send_aftercare_and_nps,
-            trigger="date",
-            run_date=dt_after,
-            args=[bot, appointment_id],
-            id=f"rem_after_{appointment_id}",
-            misfire_grace_time=1800,
-            replace_existing=True
-        )
+    if has_tg:
+        dt_after = visit_dt + timedelta(minutes=duration_min)
+        if dt_after > now:
+            scheduler.add_job(
+                send_aftercare_and_nps,
+                trigger="date",
+                run_date=dt_after,
+                args=[bot, appointment_id],
+                id=f"rem_after_{appointment_id}",
+                misfire_grace_time=1800,
+                replace_existing=True
+            )
 
-    repeat_days = await db.get_repeat_days(app.get("cat_id", "hair_removal"))
-    dt_repeat = visit_dt + timedelta(days=repeat_days)
-    if dt_repeat > now:
-        scheduler.add_job(
-            send_repeat_reminder,
-            trigger="date",
-            run_date=dt_repeat,
-            args=[bot, appointment_id],
-            id=f"rem_rep_{appointment_id}",
-            misfire_grace_time=3600,
-            replace_existing=True
-        )
+        repeat_days = await db.get_repeat_days(app.get("cat_id", "hair_removal"))
+        dt_repeat = visit_dt + timedelta(days=repeat_days)
+        if dt_repeat > now:
+            scheduler.add_job(
+                send_repeat_reminder,
+                trigger="date",
+                run_date=dt_repeat,
+                args=[bot, appointment_id],
+                id=f"rem_rep_{appointment_id}",
+                misfire_grace_time=3600,
+                replace_existing=True
+            )
 
 
 async def send_weekly_digest_job(bot: Bot):

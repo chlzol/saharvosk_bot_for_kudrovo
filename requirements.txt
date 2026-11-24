@@ -6,3 +6,4 @@ apscheduler>=3.10.4
 pydantic-settings>=2.2.1
 python-dotenv>=1.0.1
 requests>=2.31.0
+maxapi-python>=2.5.0

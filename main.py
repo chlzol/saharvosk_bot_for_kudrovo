@@ -5,7 +5,7 @@ from aiohttp import web
 from aiogram import Bot, Dispatcher
 import config
 from database.db import init_db
-from services import yclients_api, webhook_handler
+from services import yclients_api, webhook_handler, max_sender
 from services.scheduler import scheduler, restore_all_reminders
 from handlers.common import router as common_router
 from handlers.booking import router as booking_router
@@ -68,6 +68,7 @@ async def main():
     await init_db()
 
     bot = Bot(token=config.BOT_TOKEN)
+    max_sender.register_bot(bot)
     dp = Dispatcher()
 
     dp.include_router(admin_router)
@@ -114,6 +115,7 @@ async def main():
         if scheduler.running:
             scheduler.shutdown(wait=False)
         await yclients_api.close_http_session()
+        await max_sender.close_max_client()
         try:
             await bot.session.close()
         except Exception:

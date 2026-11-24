@@ -1048,7 +1048,7 @@ async def cb_admin_show_apps(call: CallbackQuery):
         lines.append(
             f"🔹 <b>Запись №{app['id']}</b> · <i>{conf_status}</i>\n"
             f"📍 Sahar&Vosk · {html.escape(app['branch_title'])}\n"
-            f"👤 <b>{html.escape(client_label)}</b> (<code>{html.escape(app.get('phone') or '—')}</code>)\n"
+            f"👤 <b>{html.escape(client_label)}</b> (<code>{html.escape(app.get('phone') or app.get('client_phone') or '—')}</code>)\n"
             f"✨ {html.escape(srv_short)} ({price_str})\n"
             f"👩‍⚕️ Специалист: {html.escape(app.get('master_name') or 'Специалист')}\n"
             f"🗓 <b>{formatted_date} в {app['visit_time']}</b>\n"

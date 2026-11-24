@@ -2126,6 +2126,7 @@ async def finalize_booking(call: CallbackQuery, state: FSMContext):
                     "telegram_id": uid,
                     "client_name": data["client_name"],
                     "phone": data["phone"],
+                    "client_phone": db.normalize_client_phone(data.get("phone")) or None,
                     "branch_id": data["branch_id"],
                     "branch_title": branch.get("title", data["branch_id"]),
                     "cat_id": data.get("cat_id", "other"),
