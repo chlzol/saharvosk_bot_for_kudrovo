@@ -45,13 +45,14 @@ def normalize_phone(raw: str | None) -> str | None:
     return digits[-10:]
 
 
-async def find_user_by_phone(phone_last10: str | None) -> dict | None:
+async def find_user_by_phone(phone: str | None) -> dict | None:
     """
     Ищет пользователя в таблице users по последним 10 цифрам телефона.
     Если с одним номером связано несколько записей, детерминированно выбирает
     самый последний / активный профиль пользователя.
     """
-    if not phone_last10 or len(phone_last10) != 10:
+    target_last10 = normalize_phone(phone)
+    if not target_last10:
         return None
     async with db._connect() as conn:
         conn.row_factory = aiosqlite.Row
@@ -63,7 +64,7 @@ async def find_user_by_phone(phone_last10: str | None) -> dict | None:
         rows = await cur.fetchall()
         for row in rows:
             user_phone = normalize_phone(row["phone"])
-            if user_phone and user_phone == phone_last10:
+            if user_phone and user_phone == target_last10:
                 return dict(row)
     return None
 
@@ -185,8 +186,8 @@ def _extract_record_data(payload: dict) -> dict | None:
     service_titles = []
     service_ids = []
     total_price = 0
-    total_duration = 0
     cat_id = ""
+    has_services_costs = False
 
     for s in services:
         if not isinstance(s, dict):
@@ -198,33 +199,43 @@ def _extract_record_data(payload: dict) -> dict | None:
         if sid is not None and str(sid).strip():
             service_ids.append(str(sid).strip())
 
-        cost = s.get("cost")
-        if cost is None:
-            cost = s.get("cost_to_pay")
-        if cost is None:
-            cost = s.get("first_cost")
-        if cost is None:
-            cost = s.get("price_max") or s.get("price_min")
-        total_price += _parse_cost(cost)
-
-        dur = s.get("seance_length") or s.get("length")
-        total_duration += _parse_duration(dur)
+        # Приоритет стоимости: cost_to_pay (к оплате с учетом скидок) -> cost -> first_cost -> price
+        s_cost = None
+        for k in ("cost_to_pay", "cost", "first_cost", "price_max", "price_min"):
+            val = s.get(k)
+            if val is not None and val != "":
+                s_cost = _parse_cost(val)
+                break
+        if s_cost is not None:
+            total_price += s_cost
+            has_services_costs = True
 
         if not cat_id and s.get("category_id"):
             cat_id = str(s.get("category_id")).strip()
 
     # Fallback если услуги не указаны в массиве, а пришли в корне data
-    if not total_price:
-        top_cost = data.get("cost") or data.get("cost_to_pay") or data.get("price") or data.get("first_cost")
-        total_price = _parse_cost(top_cost)
+    has_root_cost = False
+    if not has_services_costs:
+        for k in ("cost_to_pay", "cost", "first_cost", "price"):
+            val = data.get(k)
+            if val is not None and val != "":
+                total_price = _parse_cost(val)
+                has_root_cost = True
+                break
 
-    if not total_duration:
-        top_dur = data.get("seance_length") or data.get("length")
-        total_duration = _parse_duration(top_dur)
+    has_explicit_cost = has_services_costs or has_root_cost
 
-    if total_duration <= 0:
+    # Длительность: в YCLIENTS seance_length в корне задает общую длительность слота в журнале
+    root_dur = _parse_duration(data.get("seance_length") or data.get("length"))
+    services_dur = sum(_parse_duration(s.get("seance_length") or s.get("length")) for s in services if isinstance(s, dict))
+    if root_dur > 0:
+        total_duration = root_dur
+    elif services_dur > 0:
+        total_duration = services_dur
+    else:
         total_duration = 30
 
+    has_explicit_services = bool(service_titles or data.get("service_title"))
     services_list = ", ".join(service_titles) if service_titles else str(data.get("service_title") or "Услуга из CRM")
     service_id = ",".join(service_ids) if service_ids else str(record_id)
 
@@ -232,6 +243,7 @@ def _extract_record_data(payload: dict) -> dict | None:
     staff = data.get("staff")
     if not isinstance(staff, dict):
         staff = {}
+    has_explicit_staff = bool((staff and (staff.get("name") or staff.get("id"))) or data.get("staff_name") or data.get("staff_id"))
     master_id = str(staff.get("id") or data.get("staff_id") or "any")
     master_name = str(staff.get("name") or data.get("staff_name") or "Любой специалист").strip()
     if not master_name:
@@ -258,12 +270,15 @@ def _extract_record_data(payload: dict) -> dict | None:
         "total_duration": total_duration,
         "master_id": master_id,
         "master_name": master_name,
+        "has_explicit_services": has_explicit_services,
+        "has_explicit_staff": has_explicit_staff,
+        "has_explicit_cost": has_explicit_cost,
         "deleted": deleted,
         "attendance": attendance,
     }
 
 
-async def _get_appointment_by_yclients_id(yclients_record_id: str) -> dict | None:
+async def _get_appointment_by_yclients_id(yclients_record_id: str | int) -> dict | None:
     """Ищет запись в таблице appointments по yclients_record_id."""
     async with db._connect() as conn:
         conn.row_factory = aiosqlite.Row
@@ -279,15 +294,16 @@ async def _find_duplicate_appointment(
     telegram_id: int, branch_id: str, visit_date: str, visit_time: str
 ) -> dict | None:
     """Ищет существующую активную запись клиента на это же время."""
+    norm_time = db.normalize_time_str(visit_time)
     async with db._connect() as conn:
         conn.row_factory = aiosqlite.Row
         cur = await conn.execute(
             """SELECT * FROM appointments
                WHERE telegram_id = ? AND branch_id = ?
-                 AND visit_date = ? AND visit_time = ?
+                 AND visit_date = ? AND substr('0' || visit_time, -5) = ?
                  AND status = 'active'
                LIMIT 1""",
-            (telegram_id, branch_id, visit_date, visit_time),
+            (telegram_id, branch_id, visit_date, norm_time),
         )
         row = await cur.fetchone()
         return dict(row) if row else None
@@ -297,10 +313,8 @@ def _is_past_datetime(visit_date: str, visit_time: str) -> bool:
     """Проверяет, прошло ли время визита относительно Московского времени."""
     now = db.now_msk()
     try:
-        parts = visit_time.split(":")
-        h, m = int(parts[0]), int(parts[1])
-        d_parts = visit_date.split("-")
-        v_dt = datetime(int(d_parts[0]), int(d_parts[1]), int(d_parts[2]), h, m)
+        norm_time = db.normalize_time_str(visit_time)
+        v_dt = datetime.fromisoformat(f"{visit_date}T{norm_time}:00")
         return v_dt < now
     except Exception:
         return False
@@ -366,7 +380,7 @@ async def handle_webhook_event(payload: dict, bot: Bot):
     finally:
         # Корректная очистка лока: удаляем только когда все задачи на этом ключе завершились
         _dedup_waiters[lock_key] = max(0, _dedup_waiters.get(lock_key, 1) - 1)
-        if _dedup_waiters[lock_key] == 0:
+        if _dedup_waiters.get(lock_key, 0) <= 0:
             _dedup_waiters.pop(lock_key, None)
             _dedup_locks.pop(lock_key, None)
 
@@ -512,10 +526,10 @@ async def _handle_create(record_data: dict, branch_id: str, bot: Bot):
             step_key="webhook_record_created",
             reply_markup=kb,
             appointment_id=appointment_id,
-            branch_title=branch_title,
-            services_list=record_data["services_list"],
-            service_title=record_data["services_list"],
-            master_name=record_data["master_name"],
+            branch_title=db.escape_md(branch_title),
+            services_list=db.escape_md(record_data["services_list"]),
+            service_title=db.escape_md(record_data["services_list"]),
+            master_name=db.escape_md(record_data["master_name"]),
             visit_date=formatted_date,
             formatted_date=formatted_date,
             visit_time=record_data["visit_time"],
@@ -554,26 +568,44 @@ async def _handle_update(record_data: dict, branch_id: str, bot: Bot):
         logger.info("Webhook UPDATE: запись #%s имеет статус '%s', пропускаем", existing["id"], existing["status"])
         return
 
-    # Синхронизация внутреннего статуса подтверждения (attendance == 2) без спама
-    if record_data["attendance"] == 2 and not existing.get("confirmed"):
-        async with db._connect() as conn:
-            await conn.execute("UPDATE appointments SET confirmed = 1 WHERE id = ?", (existing["id"],))
-            await conn.commit()
-        logger.info("Webhook UPDATE: запись #%s отмечена подтверждённой в CRM", existing["id"])
+    norm_rec_time = db.normalize_time_str(record_data["visit_time"])
+    record_data["visit_time"] = norm_rec_time
+    norm_exist_time = db.normalize_time_str(existing["visit_time"])
+
+    incoming_phone = record_data.get("client_phone", "").strip()
+    existing_phone = existing.get("phone", "").strip()
+    phone_changed = bool(incoming_phone) and (normalize_phone(incoming_phone) != normalize_phone(existing_phone))
 
     # Проверяем изменения ключевых полей
     date_changed = record_data["visit_date"] != existing["visit_date"]
-    time_changed = record_data["visit_time"] != existing["visit_time"]
+    time_changed = norm_rec_time != norm_exist_time
+    attendance_confirmed = record_data["attendance"] == 2 and not existing.get("confirmed")
     master_changed = (
-        bool(record_data["master_name"])
+        record_data["has_explicit_staff"]
+        and bool(record_data["master_name"])
         and record_data["master_name"] != existing["master_name"]
         and record_data["master_name"] != "Любой специалист"
     )
-    service_changed = bool(record_data["services_list"]) and record_data["services_list"] != existing["service_title"]
-    price_changed = bool(record_data["total_price"]) and record_data["total_price"] != existing.get("price", 0)
+    service_changed = (
+        record_data["has_explicit_services"]
+        and bool(record_data["services_list"])
+        and record_data["services_list"] != existing["service_title"]
+        and record_data["services_list"] != "Услуга из CRM"
+    )
+    price_changed = record_data["has_explicit_cost"] and record_data["total_price"] != existing.get("price", 0)
+    duration_changed = bool(record_data["total_duration"]) and record_data["total_duration"] != existing.get("duration", 30)
 
     # Если ничего не поменялось
-    if not (date_changed or time_changed or master_changed or service_changed or price_changed):
+    if not (
+        date_changed
+        or time_changed
+        or master_changed
+        or service_changed
+        or price_changed
+        or attendance_confirmed
+        or phone_changed
+        or duration_changed
+    ):
         logger.info("Webhook UPDATE: запись #%s без изменений расписания", existing["id"])
         return
 
@@ -584,17 +616,43 @@ async def _handle_update(record_data: dict, branch_id: str, bot: Bot):
 
     # Обновляем БД
     update_fields = {}
+    reassigned_to_valid_user = False
+    if phone_changed:
+        new_user = await find_user_by_phone(incoming_phone)
+        if new_user:
+            update_fields["telegram_id"] = new_user["telegram_id"]
+            update_fields["client_name"] = record_data["client_name"] or new_user.get("real_name") or "Гость"
+            update_fields["phone"] = incoming_phone
+            existing["telegram_id"] = new_user["telegram_id"]
+            existing["phone"] = incoming_phone
+            reassigned_to_valid_user = True
+            logger.info("Webhook UPDATE: запись #%s переписана на клиента telegram_id=%s (тел %s)", existing["id"], new_user["telegram_id"], incoming_phone)
+        else:
+            update_fields["telegram_id"] = None
+            update_fields["client_name"] = record_data["client_name"]
+            update_fields["phone"] = incoming_phone
+            existing["telegram_id"] = None
+            existing["phone"] = incoming_phone
+            remove_appointment_reminders(existing["id"])
+            logger.info("Webhook UPDATE: запись #%s переписана на незарегистрированный телефон %s, напоминания сняты", existing["id"], incoming_phone)
+
+    if attendance_confirmed:
+        update_fields["confirmed"] = 1
+        logger.info("Webhook UPDATE: запись #%s отмечена подтверждённой в CRM", existing["id"])
     if date_changed:
         update_fields["visit_date"] = record_data["visit_date"]
     if time_changed:
-        update_fields["visit_time"] = record_data["visit_time"]
+        update_fields["visit_time"] = norm_rec_time
     if master_changed:
         update_fields["master_name"] = record_data["master_name"]
         update_fields["master_id"] = record_data["master_id"]
     if service_changed:
         update_fields["service_title"] = record_data["services_list"]
+        update_fields["service_id"] = record_data["service_id"]
     if price_changed:
         update_fields["price"] = record_data["total_price"]
+    if duration_changed:
+        update_fields["duration"] = record_data["total_duration"]
 
     if not update_fields:
         logger.info("Webhook UPDATE: запись #%s без обновляемых полей в БД", existing["id"])
@@ -608,16 +666,17 @@ async def _handle_update(record_data: dict, branch_id: str, bot: Bot):
 
     logger.info("Webhook UPDATE: запись #%s обновлена: %s", existing["id"], list(update_fields.keys()))
 
-    # Если изменились дата или время — пересоздаём таймеры напоминаний
-    if date_changed or time_changed:
+    # Если изменились дата, время или клиент перепривязан — пересоздаём таймеры напоминаний
+    has_tg = bool(existing.get("telegram_id") and int(existing["telegram_id"]) > 0)
+    if (date_changed or time_changed or reassigned_to_valid_user) and has_tg:
         try:
             await schedule_appointment_reminders(bot, existing["id"])
         except Exception as e:
             logger.error("Webhook: ошибка пересоздания напоминаний #%s: %s", existing["id"], e)
 
     # Уведомляем клиента, только если поменялись дата, время или специалист
-    if date_changed or time_changed or master_changed:
-        telegram_id = existing["telegram_id"]
+    if (date_changed or time_changed or master_changed) and has_tg:
+        telegram_id = int(existing["telegram_id"])
         branch_title = _get_branch_title(branch_id)
         new_date = record_data["visit_date"] if date_changed else existing["visit_date"]
         new_time = record_data["visit_time"] if time_changed else existing["visit_time"]
@@ -653,10 +712,10 @@ async def _handle_update(record_data: dict, branch_id: str, bot: Bot):
                 step_key="webhook_record_updated",
                 reply_markup=kb,
                 appointment_id=existing["id"],
-                branch_title=branch_title,
-                services_list=new_services,
-                service_title=new_services,
-                master_name=new_master,
+                branch_title=db.escape_md(branch_title),
+                services_list=db.escape_md(new_services),
+                service_title=db.escape_md(new_services),
+                master_name=db.escape_md(new_master),
                 visit_date=formatted_date,
                 formatted_date=formatted_date,
                 visit_time=new_time,
@@ -697,21 +756,23 @@ async def _handle_delete(record_data: dict, branch_id: str, bot: Bot):
     logger.info("Webhook DELETE: запись #%s успешно отменена", existing["id"])
 
     # Уведомляем гостя
-    telegram_id = existing["telegram_id"]
+    telegram_id = existing.get("telegram_id")
+    if not telegram_id or int(telegram_id) <= 0:
+        return
     branch_title = _get_branch_title(branch_id)
     formatted_date = date.fromisoformat(existing["visit_date"]).strftime("%d.%m.%Y")
 
     try:
         await db.render_step_to_chat(
             bot,
-            chat_id=telegram_id,
+            chat_id=int(telegram_id),
             step_key="webhook_record_cancelled",
             reply_markup=ikb.repeat_booking_kb(has_past_visit=True),
             appointment_id=existing["id"],
-            branch_title=branch_title,
-            services_list=existing["service_title"],
-            service_title=existing["service_title"],
-            master_name=existing["master_name"],
+            branch_title=db.escape_md(branch_title),
+            services_list=db.escape_md(existing["service_title"]),
+            service_title=db.escape_md(existing["service_title"]),
+            master_name=db.escape_md(existing["master_name"]),
             visit_date=formatted_date,
             formatted_date=formatted_date,
             visit_time=existing["visit_time"],

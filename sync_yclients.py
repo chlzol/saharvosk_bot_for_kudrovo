@@ -1,4 +1,5 @@
 import re
+import os
 import json
 import logging
 import asyncio
@@ -241,14 +242,28 @@ async def run_yclients_sync() -> dict:
     if not services_result or not masters_result:
         raise RuntimeError("Пустой результат синхронизации YCLIENTS — каталог booking_data.py не перезаписан.")
 
+    # Валидация филиалов и полноты каталога
+    for branch_key, comp_id in YCLIENTS_COMPANIES.items():
+        if comp_id:
+            if branch_key not in branches_result:
+                raise RuntimeError(f"Синхронизация прервана: филиал '{branch_key}' не получен от YCLIENTS!")
+            branch_srv_count = sum(1 for s in services_result.values() if branch_key in s.get("branches", []))
+            if branch_srv_count == 0:
+                raise RuntimeError(f"Синхронизация прервана: в филиале '{branch_key}' 0 услуг!")
+            branch_m_count = sum(1 for m in masters_result.values() if branch_key in m.get("branches", []))
+            if branch_m_count == 0:
+                raise RuntimeError(f"Синхронизация прервана: в филиале '{branch_key}' 0 специалистов!")
+
     output_path = "services/booking_data.py"
-    with open(output_path, "w", encoding="utf-8") as f:
+    tmp_path = f"{output_path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
         f.write("# Файл сгенерирован автоматически из YCLIENTS API для Sahar&Vosk\n\n")
         f.write(f"BRANCHES = {json.dumps(branches_result, ensure_ascii=False, indent=4)}\n\n")
         f.write(f"CATEGORIES = {json.dumps(categories_result, ensure_ascii=False, indent=4)}\n\n")
         f.write(f"SERVICES = {json.dumps(services_result, ensure_ascii=False, indent=4)}\n\n")
         f.write(f"MASTERS = {json.dumps(masters_result, ensure_ascii=False, indent=4)}\n")
 
+    os.replace(tmp_path, output_path)
     bs.reload_booking_data()
 
     prazh_total = sum(1 for s in services_result.values() if "prazhskaya" in s["branches"])

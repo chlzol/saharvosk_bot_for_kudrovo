@@ -1,4 +1,5 @@
 import aiosqlite
+from contextlib import asynccontextmanager
 from datetime import datetime, date, timedelta, timezone
 from aiogram.types import Message, CallbackQuery
 from aiogram.exceptions import TelegramBadRequest
@@ -624,7 +625,7 @@ def get_step_group(step_key: str) -> str:
         return "subcats"
     if step_key.startswith(("rem_", "nps_")):
         return "memos"
-    if step_key.startswith("step_") or step_key.startswith("webhook_"):
+    if step_key.startswith("step_") or step_key.startswith(("webhook_", "repeat_", "confirm_")):
         return "booking"
     return "menu"
 
@@ -632,6 +633,39 @@ def get_step_group(step_key: str) -> str:
 class SafeFormatDict(dict):
     def __missing__(self, key):
         return "{" + key + "}"
+
+
+def escape_md(value: str | None) -> str:
+    """Экранирует спецсимволы классического Telegram Markdown."""
+    if not value:
+        return ""
+    return (
+        str(value)
+        .replace("\\", "\\\\")
+        .replace("_", "\\_")
+        .replace("*", "\\*")
+        .replace("`", "\\`")
+        .replace("[", "\\[")
+    )
+
+
+def _utf16_len(text: str) -> int:
+    """Возвращает длину строки в UTF-16 code units (метрика лимитов Telegram)."""
+    return len((text or "").encode("utf-16-le")) // 2
+
+
+def _clip_utf16(text: str | None, max_units: int = 1024) -> str:
+    """Обрезает строку до лимита UTF-16 code units, не разрывая суррогатные пары эмодзи."""
+    s = text or ""
+    if _utf16_len(s) <= max_units:
+        return s
+    raw = s.encode("utf-16-le")[: max_units * 2]
+    while len(raw) >= 2:
+        try:
+            return raw.decode("utf-16-le")
+        except UnicodeDecodeError:
+            raw = raw[:-2]
+    return ""
 
 
 def _format_step_text(raw_text: str, kwargs: dict) -> str:
@@ -646,8 +680,12 @@ def _format_step_text(raw_text: str, kwargs: dict) -> str:
         return text
 
 
-def _connect():
-    return aiosqlite.connect(DB_NAME, timeout=25.0)
+@asynccontextmanager
+async def _connect():
+    async with aiosqlite.connect(DB_NAME, timeout=25.0) as db:
+        await db.execute("PRAGMA busy_timeout=25000;")
+        await db.execute("PRAGMA foreign_keys=ON;")
+        yield db
 
 
 async def _fetch_scalar(cur, default=0):
@@ -737,6 +775,14 @@ async def init_db():
             pass
         try:
             await db.execute("CREATE INDEX IF NOT EXISTS idx_appointments_branch ON appointments(branch_id, status);")
+        except Exception:
+            pass
+        try:
+            await db.execute("""
+                UPDATE appointments
+                SET visit_time = substr('0' || visit_time, -5)
+                WHERE length(visit_time) = 4 AND visit_time LIKE '_:__';
+            """)
         except Exception:
             pass
 
@@ -1141,7 +1187,7 @@ async def render_step_to_chat(
     text = _format_step_text(raw_text, kwargs) or " "
     photo_id = step.get("photo_id")
 
-    if photo_id and len(text) <= 1024:
+    if photo_id and _utf16_len(text) <= 1024:
         try:
             await bot.send_photo(chat_id=chat_id, photo=photo_id, caption=text, reply_markup=reply_markup, parse_mode="Markdown")
             return
@@ -1152,16 +1198,17 @@ async def render_step_to_chat(
             except Exception:
                 pass
 
-    if photo_id and len(text) > 1024:
+    if photo_id and _utf16_len(text) > 1024:
         try:
             await bot.send_photo(chat_id=chat_id, photo=photo_id)
         except Exception:
             pass
 
+    msg_text = _clip_utf16(text, 4096)
     try:
-        await bot.send_message(chat_id=chat_id, text=text[:4096], reply_markup=reply_markup, parse_mode="Markdown", disable_web_page_preview=True)
+        await bot.send_message(chat_id=chat_id, text=msg_text, reply_markup=reply_markup, parse_mode="Markdown", disable_web_page_preview=True)
     except TelegramBadRequest:
-        await bot.send_message(chat_id=chat_id, text=text[:4096], reply_markup=reply_markup, disable_web_page_preview=True)
+        await bot.send_message(chat_id=chat_id, text=msg_text, reply_markup=reply_markup, disable_web_page_preview=True)
 
 
 async def render_step(
@@ -1176,9 +1223,10 @@ async def render_step(
     raw_text = step["custom_text"] or DEFAULT_STEPS.get(step_key, {}).get("text", "")
     text = _format_step_text(raw_text, kwargs) or " "
     photo_id = step.get("photo_id")
+    msg_text = _clip_utf16(text, 4096)
 
     if isinstance(target, Message):
-        if photo_id and len(text) <= 1024:
+        if photo_id and _utf16_len(text) <= 1024:
             try:
                 await target.answer_photo(photo=photo_id, caption=text, reply_markup=reply_markup, parse_mode="Markdown")
                 return
@@ -1188,16 +1236,15 @@ async def render_step(
                     return
                 except Exception:
                     pass
-                return
-        elif photo_id and len(text) > 1024:
+        elif photo_id and _utf16_len(text) > 1024:
             try:
                 await target.answer_photo(photo=photo_id)
             except Exception:
                 pass
         try:
-            await target.answer(text=text[:4096], reply_markup=reply_markup, parse_mode="Markdown", disable_web_page_preview=True)
+            await target.answer(text=msg_text, reply_markup=reply_markup, parse_mode="Markdown", disable_web_page_preview=True)
         except TelegramBadRequest:
-            await target.answer(text=text[:4096], reply_markup=reply_markup, disable_web_page_preview=True)
+            await target.answer(text=msg_text, reply_markup=reply_markup, disable_web_page_preview=True)
         return
 
     msg = getattr(target, "message", target)
@@ -1205,23 +1252,23 @@ async def render_step(
 
     if not force_new and not has_old_photo and not photo_id:
         try:
-            await msg.edit_text(text=text[:4096], reply_markup=reply_markup, parse_mode="Markdown", disable_web_page_preview=True)
+            await msg.edit_text(text=msg_text, reply_markup=reply_markup, parse_mode="Markdown", disable_web_page_preview=True)
         except TelegramBadRequest as e:
             err_lower = str(e).lower()
             if "message is not modified" in err_lower:
                 return
             if "message can't be edited" in err_lower or "message to edit not found" in err_lower:
                 try:
-                    await msg.answer(text=text[:4096], reply_markup=reply_markup, parse_mode="Markdown", disable_web_page_preview=True)
+                    await msg.answer(text=msg_text, reply_markup=reply_markup, parse_mode="Markdown", disable_web_page_preview=True)
                     return
                 except TelegramBadRequest:
                     try:
-                        await msg.answer(text=text[:4096], reply_markup=reply_markup, disable_web_page_preview=True)
+                        await msg.answer(text=msg_text, reply_markup=reply_markup, disable_web_page_preview=True)
                         return
                     except Exception:
                         pass
             try:
-                await msg.edit_text(text=text[:4096], reply_markup=reply_markup, disable_web_page_preview=True)
+                await msg.edit_text(text=msg_text, reply_markup=reply_markup, disable_web_page_preview=True)
             except Exception:
                 pass
     else:
@@ -1229,7 +1276,7 @@ async def render_step(
             await msg.delete()
         except Exception:
             pass
-        if photo_id and len(text) <= 1024:
+        if photo_id and _utf16_len(text) <= 1024:
             try:
                 await msg.answer_photo(photo=photo_id, caption=text, reply_markup=reply_markup, parse_mode="Markdown")
                 return
@@ -1239,16 +1286,15 @@ async def render_step(
                     return
                 except Exception:
                     pass
-                return
-        elif photo_id and len(text) > 1024:
+        elif photo_id and _utf16_len(text) > 1024:
             try:
                 await msg.answer_photo(photo=photo_id)
             except Exception:
                 pass
         try:
-            await msg.answer(text=text[:4096], reply_markup=reply_markup, parse_mode="Markdown", disable_web_page_preview=True)
+            await msg.answer(text=msg_text, reply_markup=reply_markup, parse_mode="Markdown", disable_web_page_preview=True)
         except TelegramBadRequest:
-            await msg.answer(text=text[:4096], reply_markup=reply_markup, disable_web_page_preview=True)
+            await msg.answer(text=msg_text, reply_markup=reply_markup, disable_web_page_preview=True)
 
 
 # --- АДМИНИСТРАТОРЫ ---
@@ -1309,6 +1355,23 @@ async def register_user(telegram_id: int, username: str | None, first_name: str 
         await db.commit()
 
 
+def normalize_time_str(time_val: str | None) -> str:
+    if not time_val:
+        return "00:00"
+    time_val = str(time_val).strip()
+    if "T" in time_val:
+        time_val = time_val.split("T")[-1]
+    elif " " in time_val:
+        time_val = time_val.split(" ")[-1]
+    parts = time_val.split(":")
+    if len(parts) >= 2:
+        try:
+            return f"{int(parts[0]):02d}:{int(parts[1]):02d}"
+        except ValueError:
+            return time_val
+    return time_val
+
+
 async def _archive_past_appointments(db: aiosqlite.Connection):
     now = now_msk()
     today_str = now.date().isoformat()
@@ -1317,15 +1380,25 @@ async def _archive_past_appointments(db: aiosqlite.Connection):
         UPDATE appointments
         SET status = 'completed'
         WHERE status = 'active'
-          AND (visit_date < ? OR (visit_date = ? AND visit_time < ?))
+          AND (visit_date < ? OR (visit_date = ? AND substr('0' || visit_time, -5) < ?))
     """, (today_str, today_str, time_str))
     await db.commit()
 
 
-async def create_appointment(data: dict) -> int:
+async def reschedule_and_create_appointment(old_app_id: int | None, telegram_id: int, new_data: dict) -> int:
     now = now_msk().isoformat(timespec="seconds")
-    duration = int(data.get("duration", 30) or 30)
+    duration = int(new_data.get("duration", 30) or 30)
+    norm_time = normalize_time_str(new_data.get("visit_time"))
+    yc_rec_id = str(new_data["yclients_record_id"]) if new_data.get("yclients_record_id") is not None else None
+
     async with _connect() as db:
+        if old_app_id:
+            await db.execute("""
+                UPDATE appointments
+                SET status = 'rescheduled'
+                WHERE id = ? AND telegram_id = ? AND status = 'active'
+            """, (old_app_id, telegram_id))
+
         cursor = await db.execute("""
             INSERT INTO appointments (
                 telegram_id, client_name, phone,
@@ -1335,11 +1408,11 @@ async def create_appointment(data: dict) -> int:
                 status, yclients_record_id, created_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)
         """, (
-            data["telegram_id"], data["client_name"], data["phone"],
-            data["branch_id"], data["branch_title"], data["cat_id"],
-            data["service_id"], data["service_title"], data["price"], duration,
-            data["master_id"], data["master_name"], data["visit_date"], data["visit_time"],
-            data.get("yclients_record_id"), now
+            new_data["telegram_id"], new_data["client_name"], new_data["phone"],
+            new_data["branch_id"], new_data["branch_title"], new_data["cat_id"],
+            new_data["service_id"], new_data["service_title"], new_data["price"], duration,
+            new_data["master_id"], new_data["master_name"], new_data["visit_date"], norm_time,
+            yc_rec_id, now
         ))
         appointment_id = cursor.lastrowid
 
@@ -1347,10 +1420,14 @@ async def create_appointment(data: dict) -> int:
             UPDATE users
             SET phone = ?, real_name = ?, last_branch_id = ?, last_visit_date = ?
             WHERE telegram_id = ?
-        """, (data["phone"], data["client_name"], data["branch_id"], data["visit_date"], data["telegram_id"]))
+        """, (new_data["phone"], new_data["client_name"], new_data["branch_id"], new_data["visit_date"], new_data["telegram_id"]))
 
         await db.commit()
         return appointment_id
+
+
+async def create_appointment(data: dict) -> int:
+    return await reschedule_and_create_appointment(None, data["telegram_id"], data)
 
 
 async def get_booked_slots(branch_id: str, master_id: str, visit_date: str) -> list[str]:
@@ -1358,7 +1435,7 @@ async def get_booked_slots(branch_id: str, master_id: str, visit_date: str) -> l
         if master_id == "any":
             return []
         cursor = await db.execute("""
-            SELECT visit_time FROM appointments
+            SELECT substr('0' || visit_time, -5) FROM appointments
             WHERE branch_id = ? AND master_id = ? AND visit_date = ? AND status = 'active'
         """, (branch_id, master_id, visit_date))
         rows = await cursor.fetchall()
@@ -1372,7 +1449,7 @@ async def get_user_active_appointments(telegram_id: int) -> list[dict]:
         cursor = await db.execute("""
             SELECT * FROM appointments
             WHERE telegram_id = ? AND status = 'active'
-            ORDER BY visit_date ASC, visit_time ASC
+            ORDER BY visit_date ASC, substr('0' || visit_time, -5) ASC, id ASC
         """, (telegram_id,))
         rows = await cursor.fetchall()
         return [dict(row) for row in rows]
@@ -1387,13 +1464,13 @@ async def get_all_active_appointments(branch_id: str | None = None) -> list[dict
             cursor = await db.execute("""
                 SELECT * FROM appointments
                 WHERE status = 'active' AND branch_id = ?
-                ORDER BY visit_date ASC, visit_time ASC
+                ORDER BY visit_date ASC, substr('0' || visit_time, -5) ASC, id ASC
             """, (branch_id,))
         else:
             cursor = await db.execute("""
                 SELECT * FROM appointments
                 WHERE status = 'active'
-                ORDER BY visit_date ASC, visit_time ASC
+                ORDER BY visit_date ASC, substr('0' || visit_time, -5) ASC, id ASC
             """)
         rows = await cursor.fetchall()
         return [dict(row) for row in rows]
@@ -1406,9 +1483,10 @@ async def get_appointments_for_scheduler() -> list[dict]:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute("""
             SELECT * FROM appointments
-            WHERE status = 'active'
-               OR (status = 'completed' AND visit_date >= ?)
-            ORDER BY visit_date ASC, visit_time ASC
+            WHERE telegram_id IS NOT NULL AND telegram_id > 0
+              AND (status = 'active'
+               OR (status = 'completed' AND visit_date >= ?))
+            ORDER BY visit_date ASC, substr('0' || visit_time, -5) ASC, id ASC
         """, (cutoff,))
         rows = await cursor.fetchall()
         return [dict(row) for row in rows]
@@ -1509,21 +1587,27 @@ async def get_admin_stats() -> dict:
 async def get_users_by_segment(segment: str) -> list[int]:
     async with _connect() as db:
         if segment == "all":
-            cursor = await db.execute("SELECT telegram_id FROM users")
+            cursor = await db.execute("SELECT telegram_id FROM users WHERE telegram_id IS NOT NULL AND telegram_id > 0")
         elif segment.startswith("branch_"):
             branch_id = segment.replace("branch_", "")
-            cursor = await db.execute("SELECT telegram_id FROM users WHERE last_branch_id = ?", (branch_id,))
+            cursor = await db.execute(
+                "SELECT telegram_id FROM users WHERE last_branch_id = ? AND telegram_id IS NOT NULL AND telegram_id > 0",
+                (branch_id,)
+            )
         elif segment.startswith("cat_"):
             cat_id = segment.replace("cat_", "")
-            cursor = await db.execute("SELECT DISTINCT telegram_id FROM appointments WHERE cat_id = ?", (cat_id,))
+            cursor = await db.execute(
+                "SELECT DISTINCT telegram_id FROM appointments WHERE cat_id = ? AND telegram_id IS NOT NULL AND telegram_id > 0",
+                (cat_id,)
+            )
         elif segment == "inactive_30":
             cutoff = (now_msk().date() - timedelta(days=30)).isoformat()
             cursor = await db.execute(
-                "SELECT telegram_id FROM users WHERE last_visit_date IS NOT NULL AND last_visit_date <= ?",
+                "SELECT telegram_id FROM users WHERE last_visit_date IS NOT NULL AND last_visit_date <= ? AND telegram_id IS NOT NULL AND telegram_id > 0",
                 (cutoff,)
             )
         else:
-            cursor = await db.execute("SELECT telegram_id FROM users")
+            cursor = await db.execute("SELECT telegram_id FROM users WHERE telegram_id IS NOT NULL AND telegram_id > 0")
 
         rows = await cursor.fetchall()
         return [row[0] for row in rows]
@@ -1754,7 +1838,7 @@ async def build_management_digest_text(start_date: str, end_date: str, is_weekly
             if m["completed"] > 0:
                 parts.append(f"{m['completed']} виз.")
             stats_str = " · ".join(parts) if parts else "активен"
-            res.append(f"  {i}. **{m['name']}** — {stats_str}")
+            res.append(f"  {i}. **{escape_md(m['name'])}** — {stats_str}")
         return "\n".join(res) + "\n"
 
     lines = [
@@ -1792,7 +1876,7 @@ async def get_last_completed_appointment(telegram_id: int) -> dict | None:
         cur = await db.execute("""
             SELECT * FROM appointments
             WHERE telegram_id = ? AND status = 'completed'
-            ORDER BY visit_date DESC, visit_time DESC, id DESC
+            ORDER BY visit_date DESC, substr('0' || visit_time, -5) DESC, id DESC
             LIMIT 1
         """, (telegram_id,))
         row = await cur.fetchone()

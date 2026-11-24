@@ -1,4 +1,5 @@
 import logging
+import asyncio
 from datetime import datetime, date, timedelta, timezone
 import aiohttp
 from config import (
@@ -21,7 +22,18 @@ def now_msk() -> datetime:
 
 async def get_http_session() -> aiohttp.ClientSession:
     global _http_session
-    if _http_session is None or _http_session.closed:
+    loop = asyncio.get_running_loop()
+    if (
+        _http_session is None
+        or _http_session.closed
+        or getattr(_http_session, "_loop", None) != loop
+        or _http_session._loop.is_closed()
+    ):
+        if _http_session and not _http_session.closed:
+            try:
+                await _http_session.close()
+            except Exception:
+                pass
         timeout = aiohttp.ClientTimeout(total=12)
         connector = aiohttp.TCPConnector(limit=100, ttl_dns_cache=300)
         _http_session = aiohttp.ClientSession(timeout=timeout, connector=connector)
@@ -31,7 +43,11 @@ async def get_http_session() -> aiohttp.ClientSession:
 async def close_http_session():
     global _http_session
     if _http_session and not _http_session.closed:
-        await _http_session.close()
+        try:
+            await _http_session.close()
+        except Exception:
+            pass
+    _http_session = None
 
 
 def _get_headers() -> dict:
@@ -51,6 +67,17 @@ def _normalize_service_ids(service_ids: str | list[str]) -> list[str]:
     return [str(s).strip() for s in service_ids if str(s).strip()]
 
 
+def _to_int_staff_id(master_id: str | int | None) -> int:
+    raw = str(master_id or "").strip()
+    if raw in ("", "any", "0") or not raw.isdigit():
+        return 0
+    return int(raw)
+
+
+def _to_int_service_ids(srv_list: list[str]) -> list[int]:
+    return [int(sid) for sid in srv_list if str(sid).strip().isdigit()]
+
+
 async def fetch_masters_for_services(branch_id: str, service_ids: str | list[str]) -> list[dict] | None:
     if not USE_YCLIENTS_API:
         return None
@@ -67,7 +94,13 @@ async def fetch_masters_for_services(branch_id: str, service_ids: str | list[str
         session = await get_http_session()
         async with session.get(url, headers=_get_headers(), params=params) as resp:
             if resp.status == 200:
-                resp_json = await resp.json()
+                try:
+                    resp_json = await resp.json()
+                except Exception:
+                    resp_json = {}
+                if isinstance(resp_json, dict) and resp_json.get("success") is False:
+                    logging.warning(f"YCLIENTS book_staff вернул success=False: {resp_json}")
+                    return None
                 staff_list = resp_json if isinstance(resp_json, list) else resp_json.get("data", [])
                 result = []
                 for st in staff_list:
@@ -81,6 +114,12 @@ async def fetch_masters_for_services(branch_id: str, service_ids: str | list[str
                         "specialization": st.get("specialization", "")
                     })
                 return result
+            elif resp.status == 429:
+                logging.warning(f"YCLIENTS book_staff: 429 Too Many Requests (company={company_id})")
+            elif resp.status in (500, 502, 503, 504):
+                logging.warning(f"YCLIENTS book_staff: {resp.status} Server Error (company={company_id})")
+            else:
+                logging.warning(f"YCLIENTS book_staff ({resp.status}): {await resp.text()}")
     except Exception as e:
         logging.error(f"Ошибка получения мастеров для услуг {srv_list}: {e}")
 
@@ -97,19 +136,31 @@ async def fetch_available_dates(branch_id: str, master_id: str, service_ids: str
 
     url = f"{BASE_URL}/book_dates/{company_id}"
     srv_list = _normalize_service_ids(service_ids)
-    params = [("service_ids[]", sid) for sid in srv_list]
-    if master_id and master_id != "any":
-        params.append(("staff_id", str(master_id)))
+    params = [("service_ids[]", sid) for sid in srv_list if str(sid).strip().isdigit()]
+    staff_int = _to_int_staff_id(master_id)
+    if staff_int > 0:
+        params.append(("staff_id", str(staff_int)))
 
     try:
         session = await get_http_session()
         async with session.get(url, headers=_get_headers(), params=params) as resp:
             if resp.status == 200:
-                resp_json = await resp.json()
+                try:
+                    resp_json = await resp.json()
+                except Exception:
+                    resp_json = {}
+                if isinstance(resp_json, dict) and resp_json.get("success") is False:
+                    logging.warning(f"YCLIENTS book_dates вернул success=False: {resp_json}")
+                    return None
                 data = resp_json.get("data", resp_json) if isinstance(resp_json, dict) else {}
                 booking_dates = data.get("booking_dates", [])
                 return [str(d) for d in booking_dates]
-            logging.warning(f"YCLIENTS book_dates ({resp.status}): {await resp.text()}")
+            elif resp.status == 429:
+                logging.warning(f"YCLIENTS book_dates: 429 Too Many Requests (company={company_id})")
+            elif resp.status in (500, 502, 503, 504):
+                logging.warning(f"YCLIENTS book_dates: {resp.status} Server Error (company={company_id})")
+            else:
+                logging.warning(f"YCLIENTS book_dates ({resp.status}): {await resp.text()}")
     except Exception as e:
         logging.error(f"Сетевая ошибка при запросе рабочих дат YCLIENTS: {e}")
 
@@ -130,16 +181,22 @@ async def _fetch_available_times_raw(
     if not company_id:
         return None
 
-    staff_param = 0 if master_id == "any" else master_id
+    staff_param = _to_int_staff_id(master_id)
     url = f"{BASE_URL}/book_times/{company_id}/{staff_param}/{date_str}"
     srv_list = _normalize_service_ids(service_ids)
-    params = [("service_ids[]", sid) for sid in srv_list]
+    params = [("service_ids[]", sid) for sid in srv_list if str(sid).strip().isdigit()]
 
     try:
         session = await get_http_session()
         async with session.get(url, headers=_get_headers(), params=params) as resp:
             if resp.status == 200:
-                data = await resp.json()
+                try:
+                    data = await resp.json()
+                except Exception:
+                    data = {}
+                if isinstance(data, dict) and data.get("success") is False:
+                    logging.warning(f"YCLIENTS book_times вернул success=False: {data}")
+                    return None
                 raw_slots = data if isinstance(data, list) else data.get("data", [])
 
                 slots = []
@@ -164,7 +221,12 @@ async def _fetch_available_times_raw(
                     return filtered
 
                 return slots
-            logging.warning(f"YCLIENTS слоты ({resp.status}): {await resp.text()}")
+            elif resp.status == 429:
+                logging.warning(f"YCLIENTS book_times: 429 Too Many Requests (company={company_id})")
+            elif resp.status in (500, 502, 503, 504):
+                logging.warning(f"YCLIENTS book_times: {resp.status} Server Error (company={company_id})")
+            else:
+                logging.warning(f"YCLIENTS слоты ({resp.status}): {await resp.text()}")
     except Exception as e:
         logging.error(f"Сетевая ошибка при запросе слотов YCLIENTS: {e}")
 
@@ -202,12 +264,12 @@ async def check_slot_available(
         return True, fresh_times or [], None
 
     url = f"{BASE_URL}/book_check/{company_id}"
-    staff_id = 0 if master_id == "any" else int(master_id)
+    staff_id = _to_int_staff_id(master_id)
     payload = {
         "appointments": [
             {
                 "id": 1,
-                "services": [int(sid) for sid in srv_list],
+                "services": _to_int_service_ids(srv_list),
                 "staff_id": staff_id,
                 "datetime": f"{date_str}T{visit_time}:00"
             }
@@ -217,14 +279,29 @@ async def check_slot_available(
     try:
         session = await get_http_session()
         async with session.post(url, json=payload, headers=_get_headers()) as resp:
+            try:
+                resp_json = await resp.json()
+            except Exception:
+                resp_json = {}
+
             if resp.status in (200, 201):
+                if isinstance(resp_json, dict) and resp_json.get("success") is False:
+                    meta = resp_json.get("meta", {})
+                    err_msg = (meta.get("message") if isinstance(meta, dict) else None) or f"Время {visit_time} больше недоступно."
+                    updated_times = [t for t in (fresh_times or []) if t != visit_time]
+                    return False, updated_times, err_msg
                 return True, fresh_times or [], None
             if resp.status in (400, 422):
-                resp_json = await resp.json()
                 meta = resp_json.get("meta", {})
                 err_msg = (meta.get("message") if isinstance(meta, dict) else None) or f"Время {visit_time} больше недоступно."
                 updated_times = [t for t in (fresh_times or []) if t != visit_time]
                 return False, updated_times, err_msg
+            if resp.status == 429:
+                logging.warning("YCLIENTS book_check: 429 Too Many Requests, доверяем финальной записи")
+                return True, fresh_times or [], None
+            if resp.status in (500, 502, 503, 504):
+                logging.warning(f"YCLIENTS book_check: {resp.status} Server Error, доверяем финальной записи")
+                return True, fresh_times or [], None
     except Exception as e:
         logging.error(f"Сетевая ошибка при проверке book_check (пропускаем к финальной записи): {e}")
 
@@ -232,7 +309,7 @@ async def check_slot_available(
 
 
 async def is_yclients_record_active(branch_id: str, yclients_record_id: str | None) -> bool:
-    if not USE_YCLIENTS_API or not yclients_record_id or yclients_record_id == "mock_record_id":
+    if not USE_YCLIENTS_API or not yclients_record_id or str(yclients_record_id) == "mock_record_id":
         return True
 
     company_id = YCLIENTS_COMPANIES.get(branch_id, 0)
@@ -245,8 +322,17 @@ async def is_yclients_record_active(branch_id: str, yclients_record_id: str | No
         async with session.get(url, headers=_get_headers()) as resp:
             if resp.status == 404:
                 return False
-            if resp.status == 200:
-                resp_json = await resp.json()
+            if resp.status == 429:
+                logging.warning(f"YCLIENTS 429 при проверке записи #{yclients_record_id}")
+                return True
+            if resp.status in (500, 502, 503, 504):
+                logging.warning(f"YCLIENTS {resp.status} при проверке записи #{yclients_record_id}")
+                return True
+            if resp.status in (200, 201):
+                try:
+                    resp_json = await resp.json()
+                except Exception:
+                    resp_json = {}
                 data = (resp_json.get("data") or {}) if isinstance(resp_json, dict) else {}
                 if data.get("deleted") is True:
                     return False
@@ -261,7 +347,7 @@ async def is_yclients_record_active(branch_id: str, yclients_record_id: str | No
 
 async def fetch_record_assigned_staff_id(branch_id: str, yclients_record_id: str) -> str | None:
     """Узнает ID мастера, которого автоматически назначил YCLIENTS при выборе 'Любой свободный специалист'."""
-    if not USE_YCLIENTS_API or not yclients_record_id or yclients_record_id == "mock_record_id":
+    if not USE_YCLIENTS_API or not yclients_record_id or str(yclients_record_id) == "mock_record_id":
         return None
 
     company_id = YCLIENTS_COMPANIES.get(branch_id, 0)
@@ -272,8 +358,11 @@ async def fetch_record_assigned_staff_id(branch_id: str, yclients_record_id: str
     try:
         session = await get_http_session()
         async with session.get(url, headers=_get_headers()) as resp:
-            if resp.status == 200:
-                resp_json = await resp.json()
+            if resp.status in (200, 201):
+                try:
+                    resp_json = await resp.json()
+                except Exception:
+                    resp_json = {}
                 data = (resp_json.get("data") or {}) if isinstance(resp_json, dict) else {}
                 staff_id = data.get("staff_id") or (data.get("staff", {}) or {}).get("id")
                 if staff_id:
@@ -298,7 +387,7 @@ async def create_yclients_record(data: dict) -> tuple[str | None, str | None, st
     url = f"{BASE_URL}/book_record/{company_id}"
     datetime_iso = f"{data['visit_date']}T{data['visit_time']}:00"
 
-    staff_id = 0 if data["master_id"] == "any" else int(data["master_id"])
+    staff_id = _to_int_staff_id(data.get("master_id"))
     srv_list = _normalize_service_ids(data.get("service_ids") or data.get("service_id", ""))
 
     payload = {
@@ -309,7 +398,7 @@ async def create_yclients_record(data: dict) -> tuple[str | None, str | None, st
         "appointments": [
             {
                 "id": 1,
-                "services": [int(sid) for sid in srv_list],
+                "services": _to_int_service_ids(srv_list),
                 "staff_id": staff_id,
                 "datetime": datetime_iso
             }
@@ -319,7 +408,11 @@ async def create_yclients_record(data: dict) -> tuple[str | None, str | None, st
     try:
         session = await get_http_session()
         async with session.post(url, json=payload, headers=_get_headers()) as resp:
-            resp_json = await resp.json()
+            try:
+                resp_json = await resp.json()
+            except Exception:
+                resp_json = {}
+
             if resp.status in (200, 201) and resp_json.get("success"):
                 records = resp_json.get("data", [])
                 if records:
@@ -334,9 +427,17 @@ async def create_yclients_record(data: dict) -> tuple[str | None, str | None, st
                     logging.info(f"Запись #{rec_id} успешно создана в YCLIENTS ({data['branch_id']})")
                     return rec_id, None, assigned_staff
 
-            meta = resp_json.get("meta", {})
-            err_msg = meta.get("message") if isinstance(meta, dict) else "Выбранное время уже занято или недоступно."
-            logging.error(f"Отказ создания записи в YCLIENTS: {resp_json}")
+            if resp.status == 429:
+                logging.warning(f"YCLIENTS create_record: 429 Too Many Requests ({data['branch_id']})")
+                return None, "Сервер расписания временно перегружен (429). Пожалуйста, повторите попытку через минуту.", None
+
+            if resp.status in (500, 502, 503, 504):
+                logging.warning(f"YCLIENTS create_record: {resp.status} Server Error ({data['branch_id']})")
+                return None, "Сервер расписания временно недоступен. Пожалуйста, повторите попытку через пару минут.", None
+
+            meta = resp_json.get("meta", {}) if isinstance(resp_json, dict) else {}
+            err_msg = (meta.get("message") if isinstance(meta, dict) else None) or "Выбранное время уже занято или недоступно."
+            logging.error(f"Отказ создания записи в YCLIENTS ({resp.status}): {resp_json}")
             return None, err_msg, None
     except Exception as e:
         logging.error(f"Сетевой сбой при создании бронирования в YCLIENTS: {e}")
@@ -344,7 +445,7 @@ async def create_yclients_record(data: dict) -> tuple[str | None, str | None, st
 
 
 async def delete_yclients_record(branch_id: str, yclients_record_id: str | None) -> bool:
-    if not USE_YCLIENTS_API or not yclients_record_id or yclients_record_id == "mock_record_id":
+    if not USE_YCLIENTS_API or not yclients_record_id or str(yclients_record_id) == "mock_record_id":
         return True
 
     company_id = YCLIENTS_COMPANIES.get(branch_id, 0)
@@ -355,10 +456,15 @@ async def delete_yclients_record(branch_id: str, yclients_record_id: str | None)
     try:
         session = await get_http_session()
         async with session.delete(url, headers=_get_headers()) as resp:
-            if resp.status in (200, 204):
-                logging.info(f"Запись #{yclients_record_id} удалена из YCLIENTS.")
+            if resp.status in (200, 204, 404):
+                logging.info(f"Запись #{yclients_record_id} успешно отменена/удалена в YCLIENTS (status {resp.status}).")
                 return True
-            logging.error(f"Ошибка отмены в YCLIENTS ({resp.status}): {await resp.text()}")
+            if resp.status == 429:
+                logging.warning(f"YCLIENTS delete_record: 429 Too Many Requests #{yclients_record_id}")
+            elif resp.status in (500, 502, 503, 504):
+                logging.warning(f"YCLIENTS delete_record: {resp.status} Server Error #{yclients_record_id}")
+            else:
+                logging.error(f"Ошибка отмены в YCLIENTS ({resp.status}): {await resp.text()}")
     except Exception as e:
         logging.error(f"Ошибка при отмене записи в YCLIENTS: {e}")
 
@@ -378,9 +484,9 @@ async def confirm_yclients_record(
     - ("ok", None) — визит успешно подтверждён в журнале YCLIENTS
     - ("cancelled", message) — запись удалена или отменена в YCLIENTS
     - ("rescheduled", message) — дата или время записи изменены в YCLIENTS
-    - ("api_error", message) — сервер YCLIENTS недоступен (таймаут, сетевой сбой, HTTP 5xx)
+    - ("api_error", message) — сервер YCLIENTS недоступен (таймаут, сетевой сбой, HTTP 5xx, 429)
     """
-    if not USE_YCLIENTS_API or not yclients_record_id or yclients_record_id == "mock_record_id":
+    if not USE_YCLIENTS_API or not yclients_record_id or str(yclients_record_id) == "mock_record_id":
         return "ok", None
 
     company_id = YCLIENTS_COMPANIES.get(branch_id, 0)
@@ -395,8 +501,17 @@ async def confirm_yclients_record(
         async with session.get(url, headers=_get_headers()) as resp:
             if resp.status == 404:
                 return "cancelled", f"Запись #{yclients_record_id} не найдена в YCLIENTS (404)."
+            if resp.status == 429:
+                logging.warning(f"YCLIENTS confirm: 429 Too Many Requests GET #{yclients_record_id}")
+                return "api_error", "Сервер YCLIENTS временно перегружен (429 Too Many Requests)."
+            if resp.status in (500, 502, 503, 504):
+                logging.warning(f"YCLIENTS GET record #{yclients_record_id} вернул серверную ошибку {resp.status}")
+                return "api_error", f"Серверная ошибка YCLIENTS ({resp.status})"
             if resp.status in (200, 201):
-                resp_json = await resp.json()
+                try:
+                    resp_json = await resp.json()
+                except Exception:
+                    resp_json = {}
                 data = (resp_json.get("data") or {}) if isinstance(resp_json, dict) else {}
 
                 # Проверка флага удаления и статуса отмены/неявки
@@ -411,9 +526,6 @@ async def confirm_yclients_record(
                     norm_time = expected_time.zfill(5)
                     if norm_time not in rec_dt and expected_time not in rec_dt:
                         return "rescheduled", f"Время записи #{yclients_record_id} изменено в YCLIENTS ({rec_dt})."
-            elif resp.status in (500, 502, 503, 504):
-                logging.warning(f"YCLIENTS GET record #{yclients_record_id} вернул серверную ошибку {resp.status}")
-                return "api_error", f"Серверная ошибка YCLIENTS ({resp.status})"
             else:
                 logging.warning(f"YCLIENTS GET record #{yclients_record_id} статус {resp.status}")
                 return "api_error", f"Ошибка YCLIENTS ({resp.status})"
@@ -431,6 +543,10 @@ async def confirm_yclients_record(
                 return "ok", None
             if resp.status == 404:
                 return "cancelled", f"Запись #{yclients_record_id} не найдена при подтверждении (404)."
+            if resp.status == 429:
+                return "api_error", "Сервер YCLIENTS временно перегружен (429 Too Many Requests)."
+            if resp.status in (500, 502, 503, 504):
+                return "api_error", f"Серверная ошибка YCLIENTS ({resp.status})."
             logging.warning(f"Ошибка ответа YCLIENTS PUT record #{yclients_record_id} ({resp.status}): {await resp.text()}")
             return "api_error", f"Ошибка сохранения в YCLIENTS ({resp.status})"
     except Exception as e:

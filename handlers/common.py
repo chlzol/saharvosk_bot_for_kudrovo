@@ -32,7 +32,7 @@ async def ensure_user_consent(message: Message) -> bool:
         message,
         "consent",
         reply_markup=ikb.consent_kb(),
-        first_name=message.from_user.first_name or "Гость"
+        first_name=escape_md(message.from_user.first_name or "Гость")
     )
     return False
 
@@ -64,7 +64,7 @@ async def cmd_start(message: Message, state: FSMContext):
             message,
             "consent",
             reply_markup=ikb.consent_kb(),
-            first_name=message.from_user.first_name or "Гость"
+            first_name=escape_md(message.from_user.first_name or "Гость")
         )
         return
 
@@ -76,7 +76,7 @@ async def cmd_start(message: Message, state: FSMContext):
         message,
         "start",
         reply_markup=get_main_keyboard(has_past_visit=has_past),
-        first_name=display_name
+        first_name=escape_md(display_name)
     )
 
 
@@ -104,7 +104,7 @@ async def cb_accept_consent(call: CallbackQuery, state: FSMContext):
         call.message,
         "start",
         reply_markup=get_main_keyboard(has_past_visit=has_past),
-        first_name=display_name
+        first_name=escape_md(display_name)
     )
 
 
@@ -172,7 +172,11 @@ async def contact_admin(message: Message, state: FSMContext):
 @router.callback_query(F.data.startswith("sup_br:"))
 async def select_support_branch(call: CallbackQuery, state: FSMContext):
     branch_id = call.data.split(":")[1]
-    branch_title = bs.get_branches().get(branch_id, {}).get("title", branch_id)
+    branch = bs.get_branches().get(branch_id)
+    if not branch:
+        await call.answer("Студия не найдена.", show_alert=True)
+        return
+    branch_title = branch.get("title", branch_id)
 
     await state.set_state(SupportState.chatting)
     await state.update_data(support_branch_id=branch_id)

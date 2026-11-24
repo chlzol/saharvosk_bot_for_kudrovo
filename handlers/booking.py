@@ -78,6 +78,49 @@ def _get_name_prompt_kb(suggested_name: str | None) -> ReplyKeyboardMarkup:
 _confirming_appointments: set[int] = set()
 _active_cart_ops: set[int] = set()
 _active_repeat_ops: set[int] = set()
+_pending_time_selection: set[int] = set()
+
+
+def _build_booking_summary(selected_ids: list[str], data: dict | None = None) -> dict:
+    """Формирует сводку услуг корзины с сохранением параметров внешней записи при переносе."""
+    data = data or {}
+    summary = bs.get_cart_summary(selected_ids)
+    fb_title = data.get("fallback_service_title")
+
+    if fb_title and (summary["count"] == 0 or summary["count"] < len(selected_ids)):
+        fb_price = int(data.get("fallback_price") or 0)
+        fb_dur = int(data.get("fallback_duration") or 30)
+        summary["titles_inline"] = fb_title
+        price_str = f" — {fb_price} ₽" if fb_price > 0 else ""
+        summary["bullet_lines"] = f"1. **{fb_title}**{price_str} ({fb_dur} мин.)"
+        summary["bullet_lines_md"] = f"1. **{escape_md(fb_title)}**{price_str} ({fb_dur} мин.)"
+        summary["total_price_num"] = fb_price
+        summary["total_price"] = f"{fb_price} ₽" if fb_price > 0 else "по прайсу"
+        summary["total_duration"] = fb_dur
+        summary["count"] = max(1, len(selected_ids))
+    else:
+        services = summary.get("services") or []
+        if services:
+            summary["bullet_lines_md"] = "\n".join(
+                f"{idx}. **{escape_md(s['title'])}** — {s['price']} ₽ ({s['duration']} мин.)"
+                for idx, s in enumerate(services, start=1)
+            )
+        else:
+            summary["bullet_lines_md"] = summary["bullet_lines"]
+    return summary
+
+
+def _resolve_master_name(master_id: str | None, data: dict | None = None) -> str:
+    """Возвращает имя специалиста с поддержкой кэша API и внешней записи."""
+    mid = str(master_id or "any")
+    data = data or {}
+    names_map = data.get("master_names_map") or {}
+    if mid in names_map and names_map[mid]:
+        return names_map[mid]
+    name = bs.get_master_name(mid)
+    if name == "Специалист" and data.get("fallback_master_name") and mid == str(data.get("master_id", "")):
+        return data["fallback_master_name"]
+    return name
 
 
 async def _safe_edit_message(call: CallbackQuery, text: str, reply_markup=None):
@@ -121,11 +164,12 @@ async def _require_state(call: CallbackQuery, state: FSMContext, *required_keys:
         if not data.get(k):
             await state.clear()
             await state.set_state(BookingState.choosing_branch)
+            has_past = await db.has_completed_appointments(call.from_user.id)
             await call.answer("🔄 Сессия обновилась. Пожалуйста, выберите студию заново.", show_alert=True)
             await db.render_step(
                 call,
                 "step_1_branch",
-                reply_markup=ikb.branches_kb(bs.get_branches())
+                reply_markup=ikb.branches_kb(bs.get_branches(), has_past_visit=has_past)
             )
             return None
     return data
@@ -134,7 +178,9 @@ async def _require_state(call: CallbackQuery, state: FSMContext, *required_keys:
 async def _resolve_masters_for_services(branch_id: str, service_ids: list[str]) -> list[dict]:
     local_masters = bs.get_masters(branch_id, service_ids)
     api_masters = await yclients_api.fetch_masters_for_services(branch_id, service_ids)
-    if api_masters is not None and len(api_masters) > 0:
+    if api_masters is not None:
+        if not api_masters:
+            return []
         if local_masters:
             local_ids = {str(m["id"]) for m in local_masters}
             intersected = [m for m in api_masters if str(m["id"]) in local_ids]
@@ -169,7 +215,11 @@ async def cmd_test_remind(message: Message):
 
 @router.callback_query(F.data.startswith("cal_ics:"))
 async def send_calendar_ics_file(call: CallbackQuery):
-    app_id = int(call.data.split(":")[1])
+    try:
+        app_id = int(call.data.split(":")[1])
+    except (ValueError, IndexError):
+        await call.answer("Запись не найдена.", show_alert=True)
+        return
     app = await db.get_appointment_by_id(app_id)
     if not app or app["telegram_id"] != call.from_user.id:
         await call.answer("Запись не найдена.", show_alert=True)
@@ -219,16 +269,20 @@ async def send_calendar_ics_file(call: CallbackQuery):
 
 @router.callback_query(F.data.startswith("nps:"))
 async def handle_nps_rating(call: CallbackQuery, state: FSMContext):
-    _, app_id_str, rating_str = call.data.split(":")
-    app_id = int(app_id_str)
-    rating = int(rating_str)
+    try:
+        _, app_id_str, rating_str = call.data.split(":")
+        app_id = int(app_id_str)
+        rating = int(rating_str)
+    except (ValueError, IndexError):
+        await call.answer("Некорректные данные оценки.", show_alert=True)
+        return
 
     if await db.has_review_for_appointment(app_id):
         await call.answer("Вы уже оставили оценку по этому визиту. Благодарим вас! ✨", show_alert=True)
         return
 
     app = await db.get_appointment_by_id(app_id)
-    if not app:
+    if not app or app["telegram_id"] != call.from_user.id:
         await call.answer("Запись не найдена.", show_alert=True)
         return
 
@@ -253,17 +307,17 @@ async def handle_nps_rating(call: CallbackQuery, state: FSMContext):
             "nps_high",
             reply_markup=ikb.yandex_review_kb(branch_id),
             stars=stars_str,
-            master_name=app["master_name"],
-            branch_title=branch_title,
-            service_title=app["service_title"]
+            master_name=escape_md(app["master_name"]),
+            branch_title=escape_md(branch_title),
+            service_title=escape_md(app["service_title"])
         )
         await notify_admins(
             call.bot,
             f"🌟 **Высокая оценка визита · Sahar&Vosk: {stars_str} ({rating}/5)**\n"
-            f"📍 Студия: {branch_title}\n"
-            f"👤 Клиент: {app['client_name']} (`{app['phone']}`)\n"
-            f"✨ Услуга: {app['service_title']}\n"
-            f"👩‍⚕️ Специалист: {app['master_name']}"
+            f"📍 Студия: {escape_md(branch_title)}\n"
+            f"👤 Клиент: {escape_md(app['client_name'])} (`{app['phone']}`)\n"
+            f"✨ Услуга: {escape_md(app['service_title'])}\n"
+            f"👩‍⚕️ Специалист: {escape_md(app['master_name'])}"
         )
         await call.answer("Благодарим за вашу оценку! ✨")
         return
@@ -400,8 +454,12 @@ async def show_price_categories(call: CallbackQuery):
 
 @router.callback_query(F.data.startswith("price_cat_pg:"))
 async def paginate_price_categories(call: CallbackQuery):
-    _, branch_id, page_str = call.data.split(":")
-    page = int(page_str)
+    try:
+        _, branch_id, page_str = call.data.split(":")
+        page = int(page_str)
+    except (ValueError, IndexError):
+        await call.answer("Некорректная страница.", show_alert=True)
+        return
     branch = bs.get_branches().get(branch_id, {})
     categories = bs.get_categories_by_branch(branch_id)
 
@@ -537,8 +595,9 @@ async def show_my_appointments(message: Message, state: FSMContext):
 
         branch = bs.get_branches().get(app["branch_id"], {})
         address = branch.get("address", app["branch_title"])
-        duration = int(app.get("duration", 30) or 30)
-        price_display = f"{app['price']} ₽" if int(app.get("price", 0)) > 0 else "по прайсу"
+        duration = int(app.get("duration") or 30)
+        price_val = int(app.get("price") or 0)
+        price_display = f"{price_val} ₽" if price_val > 0 else "по прайсу"
 
         google_url = ch.generate_google_calendar_url(
             title=f"Sahar&Vosk — {app['service_title']}",
@@ -560,9 +619,9 @@ async def show_my_appointments(message: Message, state: FSMContext):
             reply_markup=kb,
             appointment_id=app["id"],
             status_badge=status_badge,
-            branch_title=app["branch_title"],
-            service_title=app["service_title"],
-            master_name=app["master_name"],
+            branch_title=escape_md(app["branch_title"]),
+            service_title=escape_md(app["service_title"]),
+            master_name=escape_md(app["master_name"]),
             formatted_date=formatted_date,
             visit_time=app["visit_time"],
             price=price_display
@@ -571,7 +630,11 @@ async def show_my_appointments(message: Message, state: FSMContext):
 
 @router.callback_query(F.data.startswith("confirm_visit:"))
 async def confirm_user_visit(call: CallbackQuery):
-    app_id = int(call.data.split(":")[1])
+    try:
+        app_id = int(call.data.split(":")[1])
+    except (ValueError, IndexError):
+        await call.answer("Запись не найдена.", show_alert=True)
+        return
     if app_id in _confirming_appointments:
         await call.answer("Запрос обрабатывается...", show_alert=False)
         return
@@ -659,7 +722,11 @@ async def confirm_user_visit(call: CallbackQuery):
 
 @router.callback_query(F.data.startswith("cancel_app:"))
 async def cancel_user_appointment(call: CallbackQuery):
-    app_id = int(call.data.split(":")[1])
+    try:
+        app_id = int(call.data.split(":")[1])
+    except (ValueError, IndexError):
+        await call.answer("Запись не найдена.", show_alert=True)
+        return
     app = await db.get_appointment_by_id(app_id)
     if not app:
         await call.answer("Запись уже была отменена или не найдена.", show_alert=True)
@@ -773,7 +840,8 @@ async def process_repeat_last_visit(target: Message | CallbackQuery, state: FSMC
             )
             return
 
-        master_in_staff = any(m["id"] == master_id for m in available_masters) if is_master_specific else False
+        master_in_staff = any(str(m["id"]) == str(master_id) for m in available_masters) if is_master_specific else False
+        main_cat_id = next(iter(bs._match_service_to_main_categories(valid_services[0])), "other")
 
         # 3. Проверяем свободные окна на ближайшие 2 месяца
         has_open_slots = False
@@ -794,18 +862,19 @@ async def process_repeat_last_visit(target: Message | CallbackQuery, state: FSMC
             await state.set_state(BookingState.choosing_master)
             await state.update_data(
                 branch_id=branch_id,
-                cat_id=valid_services[0].get("cat_id") or "other",
+                cat_id=main_cat_id,
                 selected_services=selected_ids,
                 service_id=selected_ids[0],
+                master_names_map={str(m["id"]): m["name"] for m in available_masters},
                 client_name=client_name,
                 phone=phone,
                 is_repeat=True,
                 mst_page=1
             )
             if is_master_specific and not master_in_staff:
-                reason = f"Специалист **{master_name}** больше не выполняет данный набор услуг в этой студии."
+                reason = f"Специалист **{escape_md(master_name)}** больше не выполняет данный набор услуг в этой студии."
             elif is_master_specific and not has_open_slots:
-                reason = f"У специалиста **{master_name}** сейчас нет свободных окон для записи на ближайшие 2 месяца."
+                reason = f"У специалиста **{escape_md(master_name)}** сейчас нет свободных окон для записи на ближайшие 2 месяца."
             else:
                 reason = "Для повтора визита выберите удобного специалиста:"
 
@@ -816,11 +885,11 @@ async def process_repeat_last_visit(target: Message | CallbackQuery, state: FSMC
                 target,
                 "repeat_master_unavailable",
                 reply_markup=kb,
-                branch_title=branch_title,
+                branch_title=escape_md(branch_title),
                 reason=reason,
-                master_name=master_name,
-                services_list=summary["titles_inline"],
-                titles_inline=summary["titles_inline"],
+                master_name=escape_md(master_name),
+                services_list=escape_md(summary["titles_inline"]),
+                titles_inline=escape_md(summary["titles_inline"]),
                 total_price=summary["total_price"],
                 total_duration=summary["total_duration"]
             )
@@ -830,11 +899,12 @@ async def process_repeat_last_visit(target: Message | CallbackQuery, state: FSMC
         await state.set_state(BookingState.choosing_date)
         await state.update_data(
             branch_id=branch_id,
-            cat_id=valid_services[0].get("cat_id") or "other",
+            cat_id=main_cat_id,
             selected_services=selected_ids,
             service_id=selected_ids[0],
             master_id=master_id,
             master_name=master_name,
+            master_names_map={str(m["id"]): m["name"] for m in available_masters},
             client_name=client_name,
             phone=phone,
             api_available_dates=api_dates,
@@ -850,10 +920,10 @@ async def process_repeat_last_visit(target: Message | CallbackQuery, state: FSMC
             target,
             "repeat_visit_summary",
             reply_markup=cal_kb,
-            branch_title=branch_title,
-            services_list=summary["titles_inline"],
-            titles_inline=summary["titles_inline"],
-            master_name=master_name,
+            branch_title=escape_md(branch_title),
+            services_list=escape_md(summary["titles_inline"]),
+            titles_inline=escape_md(summary["titles_inline"]),
+            master_name=escape_md(master_name),
             total_duration=summary["total_duration"],
             total_price=summary["total_price"]
         )
@@ -875,27 +945,43 @@ async def cb_repeat_last_visit(call: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data.startswith("reschedule_app:"))
 async def reschedule_user_appointment(call: CallbackQuery, state: FSMContext):
-    app_id = int(call.data.split(":")[1])
+    try:
+        app_id = int(call.data.split(":")[1])
+    except (ValueError, IndexError):
+        await call.answer("Запись не найдена.", show_alert=True)
+        return
     app = await db.get_appointment_by_id(app_id)
 
     if not app or app["telegram_id"] != call.from_user.id or app["status"] != "active":
         await call.answer("Запись не найдена или уже отменена.", show_alert=True)
         return
 
-    srv_list = [s.strip() for s in str(app["service_id"]).split(",") if s.strip()]
-    api_dates = await yclients_api.fetch_available_dates(app["branch_id"], app["master_id"], srv_list)
+    raw_srv_list = [s.strip() for s in str(app.get("service_id") or "").split(",") if s.strip()]
+    yc_rec_id = str(app.get("yclients_record_id") or "")
+    # Если вебхук сохранил record_id как заглушку service_id при пустых услугах — не передаем его как service_id в API
+    if yc_rec_id and len(raw_srv_list) == 1 and raw_srv_list[0] == yc_rec_id and not bs.get_service_by_id(raw_srv_list[0]):
+        srv_list = []
+    else:
+        srv_list = raw_srv_list
+
+    master_id = str(app.get("master_id") or "any")
+    api_dates = await yclients_api.fetch_available_dates(app["branch_id"], master_id, srv_list)
 
     await state.clear()
     await state.update_data(
         reschedule_app_id=app_id,
         branch_id=app["branch_id"],
-        cat_id=app["cat_id"],
+        cat_id=app.get("cat_id") or "other",
         service_id=srv_list[0] if srv_list else "",
         selected_services=srv_list,
-        master_id=app["master_id"],
+        master_id=master_id,
         phone=app["phone"],
         client_name=app["client_name"],
-        api_available_dates=api_dates
+        api_available_dates=api_dates,
+        fallback_service_title=app.get("service_title") or "Услуга",
+        fallback_price=int(app.get("price") or 0),
+        fallback_duration=int(app.get("duration") or 30),
+        fallback_master_name=app.get("master_name") or "Специалист",
     )
     await state.set_state(BookingState.choosing_date)
 
@@ -904,7 +990,7 @@ async def reschedule_user_appointment(call: CallbackQuery, state: FSMContext):
         call,
         "step_5_date",
         reply_markup=ikb.calendar_kb(today.year, today.month, api_dates=api_dates),
-        master_name=app["master_name"]
+        master_name=escape_md(app.get("master_name") or "Специалист")
     )
     await call.answer("Выберите новую дату визита (текущая запись сохранится до подтверждения)")
 
@@ -977,7 +1063,11 @@ async def paginate_categories(call: CallbackQuery, state: FSMContext):
     data = await _require_state(call, state, "branch_id")
     if not data:
         return
-    page = int(call.data.split(":")[1])
+    try:
+        page = int(call.data.split(":")[1])
+    except (ValueError, IndexError):
+        await call.answer("Некорректная страница.", show_alert=True)
+        return
     await state.update_data(cat_page=page)
     categories = bs.get_categories_by_branch(data["branch_id"])
     branch = bs.get_branches().get(data["branch_id"], {})
@@ -995,10 +1085,11 @@ async def paginate_categories(call: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "back:branches")
 async def back_to_branches(call: CallbackQuery, state: FSMContext):
     await state.set_state(BookingState.choosing_branch)
+    has_past = await db.has_completed_appointments(call.from_user.id)
     await db.render_step(
         call,
         "step_1_branch",
-        reply_markup=ikb.branches_kb(bs.get_branches())
+        reply_markup=ikb.branches_kb(bs.get_branches(), has_past_visit=has_past)
     )
     await call.answer()
 
@@ -1036,7 +1127,11 @@ async def paginate_subcategories(call: CallbackQuery, state: FSMContext):
     if not data:
         return
 
-    page = int(call.data.split(":")[1])
+    try:
+        page = int(call.data.split(":")[1])
+    except (ValueError, IndexError):
+        await call.answer("Некорректная страница.", show_alert=True)
+        return
     await state.update_data(subcat_page=page)
     branch_id = data["branch_id"]
     cat_id = data["cat_id"]
@@ -1057,7 +1152,7 @@ async def paginate_subcategories(call: CallbackQuery, state: FSMContext):
 
 
 @router.callback_query(F.data == "back:categories")
-async def back_to_categories(call: CallbackQuery, state: FSMContext):
+async def back_to_categories(call: CallbackQuery, state: FSMContext, answer_cb: bool = True):
     data = await _require_state(call, state, "branch_id")
     if not data:
         return
@@ -1074,7 +1169,8 @@ async def back_to_categories(call: CallbackQuery, state: FSMContext):
         reply_markup=ikb.categories_kb(categories, page=page, selected_count=sel_cnt),
         branch_title=branch.get("title", data["branch_id"])
     )
-    await call.answer()
+    if answer_cb:
+        await call.answer()
 
 
 @router.callback_query(F.data.startswith("subcat:"))
@@ -1194,7 +1290,11 @@ async def paginate_services(call: CallbackQuery, state: FSMContext):
     if not data:
         return
 
-    page = int(call.data.split(":")[1])
+    try:
+        page = int(call.data.split(":")[1])
+    except (ValueError, IndexError):
+        await call.answer("Некорректная страница.", show_alert=True)
+        return
     await state.update_data(srv_page=page)
     branch_id = data["branch_id"]
     cat_id = data["cat_id"]
@@ -1261,7 +1361,7 @@ async def _render_cart_screen(call: CallbackQuery, state: FSMContext):
     branch_id = data["branch_id"]
     selected_ids = data.get("selected_services", [])
     branch = bs.get_branches().get(branch_id, {})
-    summary = bs.get_cart_summary(selected_ids)
+    summary = _build_booking_summary(selected_ids, data)
 
     # Умные допродажи (Upsell): подбор 1-2 подходящих сопутствующих услуг
     upsell_services = bs.get_upsell_recommendations(branch_id, selected_ids, max_count=2)
@@ -1270,7 +1370,7 @@ async def _render_cart_screen(call: CallbackQuery, state: FSMContext):
         upsell_step = await db.get_step_content("step_cart_upsell")
         u_raw = upsell_step["custom_text"] or db.DEFAULT_STEPS.get("step_cart_upsell", {}).get("text", "")
         u_formatted = db._format_step_text(u_raw, {
-            "branch_title": branch.get("title", branch_id),
+            "branch_title": escape_md(branch.get("title", branch_id)),
             "total_price": summary["total_price"],
             "total_duration": summary["total_duration"]
         })
@@ -1282,9 +1382,9 @@ async def _render_cart_screen(call: CallbackQuery, state: FSMContext):
         call,
         "step_cart",
         reply_markup=ikb.cart_kb(summary["services"], upsell_services=upsell_services),
-        branch_title=branch.get("title", branch_id),
+        branch_title=escape_md(branch.get("title", branch_id)),
         count=summary["count"],
-        services_list=summary["bullet_lines"],
+        services_list=summary["bullet_lines_md"],
         total_price=summary["total_price"],
         total_duration=summary["total_duration"],
         upsell_block=upsell_block_str
@@ -1401,17 +1501,17 @@ async def open_cart_callback(call: CallbackQuery, state: FSMContext):
 
 
 @router.callback_query(F.data == "cart:add_more")
-async def cart_add_more_same_category(call: CallbackQuery, state: FSMContext):
+async def cart_add_more_same_category(call: CallbackQuery, state: FSMContext, answer_cb: bool = True):
     data = await _require_state(call, state, "branch_id")
     if not data:
         return
 
-    if not data.get("cat_id"):
-        await cart_add_from_other_category(call, state)
+    cat_id = data.get("cat_id")
+    if not cat_id or cat_id not in bs.MAIN_CATEGORIES_CONFIG:
+        await cart_add_from_other_category(call, state, answer_cb=answer_cb)
         return
 
     branch_id = data["branch_id"]
-    cat_id = data["cat_id"]
     subcat_id = data.get("subcat_id", "all")
     sub2_id = data.get("sub2_id")
     page = data.get("srv_page", 1)
@@ -1438,11 +1538,12 @@ async def cart_add_more_same_category(call: CallbackQuery, state: FSMContext):
         cat_title=cat_title,
         subcat_title=subcat_title
     )
-    await call.answer("Выберите дополнительную процедуру")
+    if answer_cb:
+        await call.answer("Выберите дополнительную процедуру")
 
 
 @router.callback_query(F.data == "cart:add_other_cat")
-async def cart_add_from_other_category(call: CallbackQuery, state: FSMContext):
+async def cart_add_from_other_category(call: CallbackQuery, state: FSMContext, answer_cb: bool = True):
     data = await _require_state(call, state, "branch_id")
     if not data:
         return
@@ -1459,35 +1560,44 @@ async def cart_add_from_other_category(call: CallbackQuery, state: FSMContext):
         reply_markup=ikb.categories_kb(categories, page=1, selected_count=sel_cnt),
         branch_title=branch.get("title", branch_id)
     )
-    await call.answer("Выберите направление для добавления процедуры")
+    if answer_cb:
+        await call.answer("Выберите направление для добавления процедуры")
 
 
 @router.callback_query(F.data.startswith("cart_del:"))
 async def cart_delete_item(call: CallbackQuery, state: FSMContext):
-    data = await _require_state(call, state, "branch_id")
-    if not data:
+    user_id = getattr(getattr(call, "from_user", None), "id", getattr(call, "user_id", 0))
+    if user_id in _active_cart_ops:
+        await call.answer()
         return
+    _active_cart_ops.add(user_id)
+    try:
+        data = await _require_state(call, state, "branch_id")
+        if not data:
+            return
 
-    del_id = call.data.split(":")[1]
-    selected_ids = [sid for sid in data.get("selected_services", []) if str(sid) != str(del_id)]
-    if selected_ids and all(bs.is_standalone_addon_service(bs.get_service_by_id(sid) or {}) for sid in selected_ids):
-        await call.answer(
-            "⚠️ Доп. услуга выполняется только вместе с основной процедурой. Сначала удалите доп. услугу или очистите выбор.",
-            show_alert=True
+        del_id = call.data.split(":")[1]
+        selected_ids = [sid for sid in data.get("selected_services", []) if str(sid) != str(del_id)]
+        if selected_ids and all(bs.is_standalone_addon_service(bs.get_service_by_id(sid) or {}) for sid in selected_ids):
+            await call.answer(
+                "⚠️ Доп. услуга выполняется только вместе с основной процедурой. Сначала удалите доп. услугу или очистите выбор.",
+                show_alert=True
+            )
+            return
+        await state.update_data(
+            selected_services=selected_ids,
+            service_id=selected_ids[0] if selected_ids else ""
         )
-        return
-    await state.update_data(
-        selected_services=selected_ids,
-        service_id=selected_ids[0] if selected_ids else ""
-    )
 
-    if not selected_ids:
-        await call.answer("Список очищен")
-        await cart_add_more_same_category(call, state)
-        return
+        if not selected_ids:
+            await call.answer("Список очищен")
+            await cart_add_more_same_category(call, state, answer_cb=False)
+            return
 
-    await call.answer("Процедура убрана из списка")
-    await _render_cart_screen(call, state)
+        await call.answer("Процедура убрана из списка")
+        await _render_cart_screen(call, state)
+    finally:
+        _active_cart_ops.discard(user_id)
 
 
 @router.callback_query(F.data == "cart:clear")
@@ -1497,7 +1607,7 @@ async def cart_clear_all(call: CallbackQuery, state: FSMContext):
         return
     await state.update_data(selected_services=[], service_id="")
     await call.answer("Выбор очищен")
-    await back_to_categories(call, state)
+    await back_to_categories(call, state, answer_cb=False)
 
 
 # --- ВЫБОР МАСТЕРА, ДАТЫ И ВРЕМЕНИ ---
@@ -1513,17 +1623,26 @@ async def proceed_from_cart_to_masters(call: CallbackQuery, state: FSMContext):
         await call.answer("Сначала выберите хотя бы одну процедуру.", show_alert=True)
         return
 
-    await state.update_data(mst_page=1)
-    await state.set_state(BookingState.choosing_master)
-
-    summary = bs.get_cart_summary(selected_ids)
     masters = await _resolve_masters_for_services(data["branch_id"], selected_ids)
+    if not masters:
+        await call.answer(
+            "⚠️ Нет доступных специалистов для выбранного сочетания процедур. Попробуйте изменить состав визита.",
+            show_alert=True
+        )
+        return
+
+    summary = _build_booking_summary(selected_ids, data)
+    await state.update_data(
+        mst_page=1,
+        master_names_map={str(m["id"]): m["name"] for m in masters}
+    )
+    await state.set_state(BookingState.choosing_master)
 
     await db.render_step(
         call,
         "step_4_master",
         reply_markup=ikb.masters_kb(masters, page=1),
-        service_title=summary["titles_inline"],
+        service_title=escape_md(summary["titles_inline"]),
         price=summary["total_price"]
     )
     await call.answer()
@@ -1535,17 +1654,22 @@ async def paginate_masters(call: CallbackQuery, state: FSMContext):
     if not data:
         return
 
-    page = int(call.data.split(":")[1])
+    try:
+        page = int(call.data.split(":")[1])
+    except (ValueError, IndexError):
+        await call.answer("Некорректная страница.", show_alert=True)
+        return
     await state.update_data(mst_page=page)
     selected_ids = data.get("selected_services") or ([data["service_id"]] if data.get("service_id") else [])
-    summary = bs.get_cart_summary(selected_ids)
+    summary = _build_booking_summary(selected_ids, data)
     masters = await _resolve_masters_for_services(data["branch_id"], selected_ids)
+    await state.update_data(master_names_map={str(m["id"]): m["name"] for m in masters})
 
     await db.render_step(
         call,
         "step_4_master",
         reply_markup=ikb.masters_kb(masters, page=page),
-        service_title=summary["titles_inline"],
+        service_title=escape_md(summary["titles_inline"]),
         price=summary["total_price"]
     )
     await call.answer()
@@ -1554,7 +1678,7 @@ async def paginate_masters(call: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "back:services")
 async def back_to_services(call: CallbackQuery, state: FSMContext):
     await call.answer()
-    await cart_add_more_same_category(call, state)
+    await cart_add_more_same_category(call, state, answer_cb=False)
 
 
 @router.callback_query(F.data.startswith("master:"))
@@ -1576,13 +1700,13 @@ async def select_master(call: CallbackQuery, state: FSMContext):
     await state.set_state(BookingState.choosing_date)
 
     today = db.now_msk().date()
-    master_name = bs.get_master_name(master_id)
+    master_name = _resolve_master_name(master_id, data)
 
     await db.render_step(
         call,
         "step_5_date",
         reply_markup=ikb.calendar_kb(today.year, today.month, api_dates=api_dates),
-        master_name=master_name
+        master_name=escape_md(master_name)
     )
     await call.answer()
 
@@ -1593,13 +1717,20 @@ async def switch_calendar_month(call: CallbackQuery, state: FSMContext):
     if not data:
         return
     api_dates = data.get("api_available_dates")
-    _, year_str, month_str = call.data.split(":")
-    year, month = int(year_str), int(month_str)
+    try:
+        _, year_str, month_str = call.data.split(":")
+        year, month = int(year_str), int(month_str)
+        if not (1 <= month <= 12):
+            raise ValueError("month out of range")
+    except (ValueError, IndexError):
+        await call.answer("Некорректный месяц.", show_alert=True)
+        return
     try:
         await call.message.edit_reply_markup(reply_markup=ikb.calendar_kb(year, month, api_dates=api_dates))
     except TelegramBadRequest as e:
-        if "message is not modified" not in str(e).lower():
-            raise
+        err_l = str(e).lower()
+        if "message is not modified" not in err_l and "message can't be edited" not in err_l and "message to edit not found" not in err_l:
+            pass
     await call.answer()
 
 
@@ -1611,15 +1742,16 @@ async def back_to_masters(call: CallbackQuery, state: FSMContext):
 
     page = data.get("mst_page", 1)
     selected_ids = data.get("selected_services") or ([data["service_id"]] if data.get("service_id") else [])
-    summary = bs.get_cart_summary(selected_ids)
+    summary = _build_booking_summary(selected_ids, data)
     masters = await _resolve_masters_for_services(data["branch_id"], selected_ids)
+    await state.update_data(master_names_map={str(m["id"]): m["name"] for m in masters})
 
     await state.set_state(BookingState.choosing_master)
     await db.render_step(
         call,
         "step_4_master",
         reply_markup=ikb.masters_kb(masters, page=page),
-        service_title=summary["titles_inline"],
+        service_title=escape_md(summary["titles_inline"]),
         price=summary["total_price"]
     )
     await call.answer()
@@ -1672,7 +1804,7 @@ async def back_to_dates(call: CallbackQuery, state: FSMContext):
     if not data:
         return
 
-    master_name = bs.get_master_name(data["master_id"])
+    master_name = _resolve_master_name(data["master_id"], data)
     api_dates = data.get("api_available_dates")
     today = db.now_msk().date()
     await state.set_state(BookingState.choosing_date)
@@ -1680,37 +1812,49 @@ async def back_to_dates(call: CallbackQuery, state: FSMContext):
         call,
         "step_5_date",
         reply_markup=ikb.calendar_kb(today.year, today.month, api_dates=api_dates),
-        master_name=master_name
+        master_name=escape_md(master_name)
     )
     await call.answer()
 
 
 @router.callback_query(F.data.startswith("time:"))
 async def select_time(call: CallbackQuery, state: FSMContext):
-    data = await _require_state(call, state, "branch_id", "master_id", "visit_date")
-    if not data:
+    uid = call.from_user.id
+    if uid in _pending_time_selection:
+        await call.answer("⏳ Проверяем выбранное время...")
         return
+    _pending_time_selection.add(uid)
+    try:
+        data = await _require_state(call, state, "branch_id", "master_id", "visit_date")
+        if not data:
+            return
 
-    visit_time = call.data.split(":", 1)[1]
-    await state.update_data(visit_time=visit_time)
+        visit_time = call.data.split(":", 1)[1]
+        await state.update_data(visit_time=visit_time)
 
-    if (data.get("reschedule_app_id") or data.get("is_repeat")) and data.get("phone") and data.get("client_name"):
+        if (
+            (data.get("reschedule_app_id") or data.get("is_repeat"))
+            and _normalize_phone(data.get("phone"))
+            and data.get("client_name")
+        ):
+            try:
+                await call.message.delete()
+            except Exception:
+                pass
+            await _verify_slot_and_confirm(call.message, state)
+            await call.answer()
+            return
+
+        await state.set_state(BookingState.entering_phone)
+
         try:
             await call.message.delete()
         except Exception:
             pass
-        await _verify_slot_and_confirm(call.message, state)
+        await db.render_step(call.message, "step_phone", reply_markup=get_phone_keyboard())
         await call.answer()
-        return
-
-    await state.set_state(BookingState.entering_phone)
-
-    try:
-        await call.message.delete()
-    except Exception:
-        pass
-    await db.render_step(call.message, "step_phone", reply_markup=get_phone_keyboard())
-    await call.answer()
+    finally:
+        _pending_time_selection.discard(uid)
 
 
 @router.message(
@@ -1798,12 +1942,16 @@ async def _verify_slot_and_confirm(message: Message, state: FSMContext):
             )
         else:
             await state.set_state(BookingState.choosing_date)
+            api_dates = data.get("api_available_dates")
+            if isinstance(api_dates, list) and data["visit_date"] in api_dates:
+                api_dates = [d for d in api_dates if d != data["visit_date"]]
+                await state.update_data(api_available_dates=api_dates)
             today = db.now_msk().date()
             await db.render_step(
                 message,
                 "step_5_date",
-                reply_markup=ikb.calendar_kb(today.year, today.month, api_dates=data.get("api_available_dates")),
-                master_name=bs.get_master_name(data["master_id"])
+                reply_markup=ikb.calendar_kb(today.year, today.month, api_dates=api_dates),
+                master_name=escape_md(_resolve_master_name(data["master_id"], data))
             )
         return
 
@@ -1814,8 +1962,8 @@ async def show_confirmation(message: Message, state: FSMContext):
     data = await state.get_data()
     branch = bs.get_branches().get(data["branch_id"], {})
     selected_ids = data.get("selected_services") or ([data["service_id"]] if data.get("service_id") else [])
-    summary = bs.get_cart_summary(selected_ids)
-    master_name = bs.get_master_name(data["master_id"])
+    summary = _build_booking_summary(selected_ids, data)
+    master_name = _resolve_master_name(data["master_id"], data)
     formatted_date = date.fromisoformat(data["visit_date"]).strftime("%d.%m.%Y")
 
     await state.set_state(BookingState.confirming)
@@ -1824,13 +1972,13 @@ async def show_confirmation(message: Message, state: FSMContext):
         message,
         "step_confirm",
         reply_markup=ikb.confirm_kb(),
-        branch_title=branch.get("title", data["branch_id"]),
-        service_title=summary["bullet_lines"],
-        master_name=master_name,
+        branch_title=escape_md(branch.get("title", data["branch_id"])),
+        service_title=summary["bullet_lines_md"],
+        master_name=escape_md(master_name),
         formatted_date=formatted_date,
         visit_time=data["visit_time"],
         price=summary["total_price"],
-        client_name=data["client_name"],
+        client_name=escape_md(data["client_name"]),
         phone=data["phone"]
     )
 
@@ -1869,11 +2017,21 @@ async def finalize_booking(call: CallbackQuery, state: FSMContext):
             if not data:
                 return
 
+            old_app_id = data.get("reschedule_app_id")
+            old_app = None
+            if old_app_id:
+                old_app = await db.get_appointment_by_id(old_app_id)
+                if not old_app or old_app["status"] != "active":
+                    await state.clear()
+                    await call.answer("⚠️ Исходная запись уже была изменена или отменена.", show_alert=True)
+                    await _safe_edit_message(call, "⚠️ Исходная запись уже неактуальна. Вы можете оформить новый визит через меню.")
+                    return
+
             branch = bs.get_branches().get(data["branch_id"], {})
             selected_ids = data.get("selected_services") or ([data["service_id"]] if data.get("service_id") else [])
-            summary = bs.get_cart_summary(selected_ids)
+            summary = _build_booking_summary(selected_ids, data)
             master_id = data["master_id"]
-            master_name = bs.get_master_name(master_id)
+            master_name = _resolve_master_name(master_id, data)
             formatted_date = date.fromisoformat(data["visit_date"]).strftime("%d.%m.%Y")
 
             is_free, fresh_times, slot_err = await yclients_api.check_slot_available(
@@ -1903,12 +2061,16 @@ async def finalize_booking(call: CallbackQuery, state: FSMContext):
                     )
                 else:
                     await state.set_state(BookingState.choosing_date)
+                    api_dates = data.get("api_available_dates")
+                    if isinstance(api_dates, list) and data["visit_date"] in api_dates:
+                        api_dates = [d for d in api_dates if d != data["visit_date"]]
+                        await state.update_data(api_available_dates=api_dates)
                     today = db.now_msk().date()
                     await db.render_step(
                         call,
                         "step_5_date",
-                        reply_markup=ikb.calendar_kb(today.year, today.month, api_dates=data.get("api_available_dates")),
-                        master_name=master_name
+                        reply_markup=ikb.calendar_kb(today.year, today.month, api_dates=api_dates),
+                        master_name=escape_md(master_name)
                     )
                 return
 
@@ -1940,44 +2102,48 @@ async def finalize_booking(call: CallbackQuery, state: FSMContext):
                     )
                 else:
                     await state.set_state(BookingState.choosing_date)
+                    api_dates = data.get("api_available_dates")
+                    if isinstance(api_dates, list) and data["visit_date"] in api_dates:
+                        api_dates = [d for d in api_dates if d != data["visit_date"]]
+                        await state.update_data(api_available_dates=api_dates)
                     today = db.now_msk().date()
                     await db.render_step(
                         call,
                         "step_5_date",
-                        reply_markup=ikb.calendar_kb(today.year, today.month, api_dates=data.get("api_available_dates")),
-                        master_name=master_name
+                        reply_markup=ikb.calendar_kb(today.year, today.month, api_dates=api_dates),
+                        master_name=escape_md(master_name)
                     )
                 return
 
             if master_id == "any" and assigned_staff_id:
                 master_id = assigned_staff_id
-                master_name = bs.get_master_name(assigned_staff_id)
+                master_name = _resolve_master_name(assigned_staff_id, data)
 
-            old_app_id = data.get("reschedule_app_id")
-            if old_app_id:
-                old_app = await db.get_appointment_by_id(old_app_id)
-                if old_app and old_app["status"] == "active":
-                    await db.reschedule_appointment(old_app_id, uid)
-                    remove_appointment_reminders(old_app_id)
-                    await yclients_api.delete_yclients_record(old_app["branch_id"], old_app.get("yclients_record_id"))
+            appointment_id = await db.reschedule_and_create_appointment(
+                old_app_id=old_app_id if (old_app and old_app["status"] == "active") else None,
+                telegram_id=uid,
+                new_data={
+                    "telegram_id": uid,
+                    "client_name": data["client_name"],
+                    "phone": data["phone"],
+                    "branch_id": data["branch_id"],
+                    "branch_title": branch.get("title", data["branch_id"]),
+                    "cat_id": data.get("cat_id", "other"),
+                    "service_id": ",".join(str(x) for x in selected_ids) or str(yclients_rec_id),
+                    "service_title": summary["titles_inline"],
+                    "price": summary["total_price_num"],
+                    "duration": summary["total_duration"],
+                    "master_id": master_id,
+                    "master_name": master_name,
+                    "visit_date": data["visit_date"],
+                    "visit_time": data["visit_time"],
+                    "yclients_record_id": yclients_rec_id
+                }
+            )
 
-            appointment_id = await db.create_appointment({
-                "telegram_id": uid,
-                "client_name": data["client_name"],
-                "phone": data["phone"],
-                "branch_id": data["branch_id"],
-                "branch_title": branch.get("title", data["branch_id"]),
-                "cat_id": data.get("cat_id", "other"),
-                "service_id": ",".join(str(x) for x in selected_ids),
-                "service_title": summary["titles_inline"],
-                "price": summary["total_price_num"],
-                "duration": summary["total_duration"],
-                "master_id": master_id,
-                "master_name": master_name,
-                "visit_date": data["visit_date"],
-                "visit_time": data["visit_time"],
-                "yclients_record_id": yclients_rec_id
-            })
+            if old_app_id and old_app and old_app["status"] == "active":
+                remove_appointment_reminders(old_app_id)
+                await yclients_api.delete_yclients_record(old_app["branch_id"], old_app.get("yclients_record_id"))
 
             await schedule_appointment_reminders(call.bot, appointment_id)
 
@@ -2018,10 +2184,10 @@ async def finalize_booking(call: CallbackQuery, state: FSMContext):
                     google_cal_url=google_cal_url
                 ),
                 appointment_id=appointment_id,
-                address=address,
-                service_title=summary["titles_inline"],
+                address=escape_md(address),
+                service_title=escape_md(summary["titles_inline"]),
                 price=summary["total_price"],
-                master_name=master_name,
+                master_name=escape_md(master_name),
                 formatted_date=formatted_date,
                 visit_time=data["visit_time"]
             )
@@ -2029,3 +2195,20 @@ async def finalize_booking(call: CallbackQuery, state: FSMContext):
             await call.answer("Бронирование подтверждено ✨")
         finally:
             _pending_bookings.discard(uid)
+        return
+
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith(("confirm:", "mst_pg:")))
+async def handle_stale_booking_callbacks(call: CallbackQuery, state: FSMContext):
+    """Перехватывает устаревшие inline-кнопки после перезапуска бота или завершения сессии."""
+    await state.clear()
+    await state.set_state(BookingState.choosing_branch)
+    has_past = await db.has_completed_appointments(call.from_user.id)
+    await call.answer("🔄 Сессия обновилась. Пожалуйста, выберите студию заново.", show_alert=True)
+    await db.render_step(
+        call,
+        "step_1_branch",
+        reply_markup=ikb.branches_kb(bs.get_branches(), has_past_visit=has_past)
+    )

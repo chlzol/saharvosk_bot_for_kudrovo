@@ -999,15 +999,19 @@ def _get_allowed_staff_set_for_service(branch_id: str, service_id: str) -> set[s
     if not service:
         return branch_master_ids
 
+    if not _service_in_branch(service, branch_id):
+        return set()
+
     staff_by_branch = service.get("staff_by_branch", {})
     if branch_id in staff_by_branch and staff_by_branch[branch_id]:
-        s_ids = {str(x) for x in staff_by_branch[branch_id]} & branch_master_ids
-        if s_ids:
-            return s_ids
+        return {str(x) for x in staff_by_branch[branch_id]} & branch_master_ids
 
-    allowed_staff_ids = {str(x) for x in service.get("staff_ids", [])} & branch_master_ids
-    if allowed_staff_ids:
-        return allowed_staff_ids
+    raw_staff_ids = service.get("staff_ids", [])
+    if raw_staff_ids:
+        return {str(x) for x in raw_staff_ids} & branch_master_ids
+
+    if staff_by_branch:
+        return set()
 
     return branch_master_ids
 
@@ -1043,9 +1047,12 @@ def get_masters(branch_id: str, service_ids: str | list[str] | None = None) -> l
 
 
 def can_combine_services(branch_id: str, current_service_ids: list[str], new_service_id: str) -> tuple[bool, str | None]:
+    new_srv = get_service_by_id(new_service_id)
+    if new_srv and not _service_in_branch(new_srv, branch_id):
+        return False, "⚠️ Выбранная услуга недоступна в данной студии."
+
     if not current_service_ids:
         # Защита: нельзя начинать корзину с доп. опции (снятие, дизайн, вросший ноготь)
-        new_srv = get_service_by_id(new_service_id)
         if new_srv and is_standalone_addon_service(new_srv):
             return (
                 False,
@@ -1056,6 +1063,19 @@ def can_combine_services(branch_id: str, current_service_ids: list[str], new_ser
 
     if str(new_service_id) in [str(x) for x in current_service_ids]:
         return False, "Эта процедура уже добавлена в ваш список."
+
+    # Изоляция грейдов: нельзя смешивать "Мастер-эксперт" и "ТОП-мастер"
+    existing_grades = {
+        g for sid in current_service_ids
+        if (s := get_service_by_id(sid)) and (g := get_service_grade(s))
+    }
+    new_grade = get_service_grade(new_srv) if new_srv else None
+    if new_grade and existing_grades and new_grade not in existing_grades:
+        return (
+            False,
+            "⚠️ Нельзя объединить в один визит услуги категорий «Мастер-эксперт» и «ТОП-мастер», "
+            "так как их выполняют специалисты разной квалификации."
+        )
 
     combined = [str(x) for x in current_service_ids] + [str(new_service_id)]
     common_masters = get_masters(branch_id, combined)
@@ -1188,13 +1208,11 @@ def get_upsell_recommendations(branch_id: str, cart_service_ids: list[str], max_
     cart_has_cedar_barrel = False
     cart_has_alginate = False
 
-    # Определение грейда в текущей корзине
-    cart_grade = None
-    for s in cart_services:
-        g = get_service_grade(s)
-        if g:
-            cart_grade = g
-            break
+    # Определение грейдов в текущей корзине
+    cart_grades = {
+        g for s in cart_services
+        if (g := get_service_grade(s))
+    }
 
     for s in cart_services:
         t = (s.get("title") or "").lower()
@@ -1359,9 +1377,7 @@ def get_upsell_recommendations(branch_id: str, cart_service_ids: list[str], max_
 
         # Критерий 4: Соответствие грейда
         cand_grade = get_service_grade(cand)
-        if cart_grade == "top" and cand_grade == "expert":
-            continue
-        if cart_grade == "expert" and cand_grade == "top":
+        if cand_grade and cart_grades and cand_grade not in cart_grades:
             continue
 
         u_title = format_upsell_title(cand)

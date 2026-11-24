@@ -2,10 +2,20 @@ import urllib.parse
 from datetime import datetime, timezone, timedelta
 
 
+MSK_TZ = timezone(timedelta(hours=3))
+
+
 def _parse_visit_dt(visit_date: str, visit_time: str) -> datetime:
-    parts = str(visit_time).split(":")
-    norm_time = f"{int(parts[0]):02d}:{int(parts[1]):02d}"
-    return datetime.fromisoformat(f"{visit_date}T{norm_time}:00")
+    raw_time = str(visit_time or "00:00").strip()
+    if "T" in raw_time:
+        raw_time = raw_time.split("T")[-1]
+    elif " " in raw_time:
+        raw_time = raw_time.split(" ")[-1]
+    parts = raw_time.split(":")
+    hour = int(parts[0]) if parts and parts[0].isdigit() else 0
+    minute = int(parts[1]) if len(parts) >= 2 and parts[1].isdigit() else 0
+    norm_time = f"{hour:02d}:{minute:02d}"
+    return datetime.fromisoformat(f"{visit_date}T{norm_time}:00").replace(tzinfo=MSK_TZ)
 
 
 def generate_google_calendar_url(
@@ -17,10 +27,12 @@ def generate_google_calendar_url(
     description: str
 ) -> str:
     """Генерирует прямую ссылку для мгновенного добавления визита в Google Календарь."""
-    start_dt = _parse_visit_dt(visit_date, visit_time)
-    end_dt = start_dt + timedelta(minutes=duration_min)
+    start_msk = _parse_visit_dt(visit_date, visit_time)
+    end_msk = start_msk + timedelta(minutes=max(1, int(duration_min or 30)))
+    start_utc = start_msk.astimezone(timezone.utc)
+    end_utc = end_msk.astimezone(timezone.utc)
 
-    dates_str = f"{start_dt.strftime('%Y%m%dT%H%M%S')}/{end_dt.strftime('%Y%m%dT%H%M%S')}"
+    dates_str = f"{start_utc.strftime('%Y%m%dT%H%M%SZ')}/{end_utc.strftime('%Y%m%dT%H%M%SZ')}"
 
     base_url = "https://calendar.google.com/calendar/render?"
     desc_text = description or ""
@@ -61,12 +73,14 @@ def generate_ics_content(
     description: str
 ) -> bytes:
     """Генерирует файл формата .ics со встроенным напоминанием за 2 часа для Apple Calendar и смартфонов."""
-    start_dt = _parse_visit_dt(visit_date, visit_time)
-    end_dt = start_dt + timedelta(minutes=duration_min)
+    start_msk = _parse_visit_dt(visit_date, visit_time)
+    end_msk = start_msk + timedelta(minutes=max(1, int(duration_min or 30)))
+    start_utc = start_msk.astimezone(timezone.utc)
+    end_utc = end_msk.astimezone(timezone.utc)
     now_utc = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
-    dtstart_str = start_dt.strftime("%Y%m%dT%H%M%S")
-    dtend_str = end_dt.strftime("%Y%m%dT%H%M%S")
+    dtstart_str = start_utc.strftime("%Y%m%dT%H%M%SZ")
+    dtend_str = end_utc.strftime("%Y%m%dT%H%M%SZ")
 
     clean_desc = (description or "").replace("\r", "").replace("\\", "\\\\").replace("\n", "\\n").replace(",", "\\,").replace(";", "\\;")
     clean_title = (title or "").replace("\r", "").replace("\\", "\\\\").replace("\n", " ").replace(",", "\\,").replace(";", "\\;")
@@ -79,10 +93,10 @@ def generate_ics_content(
         "CALSCALE:GREGORIAN\r\n"
         "METHOD:PUBLISH\r\n"
         "BEGIN:VEVENT\r\n"
-        f"UID:saharvosk-{app_id}-{start_dt.strftime('%Y%m%d%H%M')}@saharvosk.ru\r\n"
+        f"UID:saharvosk-{app_id}-{start_msk.strftime('%Y%m%d%H%M')}@saharvosk.ru\r\n"
         "DTSTAMP:" + now_utc + "\r\n"
-        f"DTSTART;TZID=Europe/Moscow:{dtstart_str}\r\n"
-        f"DTEND;TZID=Europe/Moscow:{dtend_str}\r\n"
+        f"DTSTART:{dtstart_str}\r\n"
+        f"DTEND:{dtend_str}\r\n"
         f"SUMMARY:{clean_title}\r\n"
         f"DESCRIPTION:{clean_desc}\r\n"
         f"LOCATION:{clean_loc}\r\n"

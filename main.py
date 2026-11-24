@@ -81,7 +81,7 @@ async def main():
     # 3. Поднимаем встроенный HTTP-сервер для вебхуков YCLIENTS
     web_runner: web.AppRunner | None = None
     if config.YCLIENTS_WEBHOOK_ENABLED:
-        app = web.Application()
+        app = web.Application(client_max_size=2 * 1024 * 1024)
         app["bot"] = bot
         app.router.add_get("/health", health_check_handler)
         app.router.add_post("/yclients/webhook", yclients_webhook_handler)
@@ -99,7 +99,16 @@ async def main():
         await dp.start_polling(bot)
     finally:
         if _background_tasks:
-            await asyncio.gather(*_background_tasks, return_exceptions=True)
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*_background_tasks, return_exceptions=True),
+                    timeout=5.0
+                )
+            except asyncio.TimeoutError:
+                logging.warning("Таймаут ожидания фоновых задач при остановке бота — отменяем оставшиеся задачи")
+                for t in _background_tasks:
+                    if not t.done():
+                        t.cancel()
         if web_runner:
             await web_runner.cleanup()
         if scheduler.running:

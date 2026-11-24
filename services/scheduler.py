@@ -19,9 +19,19 @@ def now_msk() -> datetime:
     return datetime.now(MSK_TZ).replace(tzinfo=None)
 
 
+def _has_valid_telegram_id(app: dict | None) -> bool:
+    if not app:
+        return False
+    tid = app.get("telegram_id")
+    try:
+        return tid is not None and int(tid) > 0
+    except (ValueError, TypeError):
+        return False
+
+
 async def _is_appointment_still_valid(app: dict | None, allow_completed: bool = False) -> bool:
     allowed = ("active", "completed") if allow_completed else ("active",)
-    if not app or app.get("status") not in allowed:
+    if not _has_valid_telegram_id(app) or app.get("status") not in allowed:
         return False
 
     yc_active = await yclients_api.is_yclients_record_active(
@@ -39,19 +49,27 @@ async def send_24h_reminder(bot: Bot, appointment_id: int, force: bool = False):
     app = await db.get_appointment_by_id(appointment_id)
     if not force and not await _is_appointment_still_valid(app):
         return
-    if not app:
+    if not _has_valid_telegram_id(app):
+        return
+
+    time_parts = str(app["visit_time"]).split(":")
+    norm_time = f"{int(time_parts[0]):02d}:{int(time_parts[1]):02d}"
+    visit_dt = datetime.fromisoformat(f"{app['visit_date']}T{norm_time}:00")
+    now = now_msk()
+    if not force and now >= visit_dt:
         return
 
     formatted_date = date.fromisoformat(app["visit_date"]).strftime("%d.%m.%Y")
     branch = bs.get_branches().get(app["branch_id"], {})
     address = branch.get("address", app["branch_title"])
+    is_confirmed = bool(app.get("confirmed") == 1)
 
     try:
         await db.render_step_to_chat(
             bot,
             chat_id=app["telegram_id"],
             step_key="rem_24h",
-            reply_markup=ikb.reminder_24h_kb(appointment_id),
+            reply_markup=ikb.reminder_24h_kb(appointment_id, is_confirmed=is_confirmed),
             address=address,
             service_title=app["service_title"],
             master_name=app["master_name"],
@@ -67,7 +85,15 @@ async def send_1h_reminder(bot: Bot, appointment_id: int, force: bool = False):
     app = await db.get_appointment_by_id(appointment_id)
     if not force and not await _is_appointment_still_valid(app):
         return
-    if not app:
+    if not _has_valid_telegram_id(app):
+        return
+
+    time_parts = str(app["visit_time"]).split(":")
+    norm_time = f"{int(time_parts[0]):02d}:{int(time_parts[1]):02d}"
+    visit_dt = datetime.fromisoformat(f"{app['visit_date']}T{norm_time}:00")
+    now = now_msk()
+    if not force and (now >= visit_dt or (visit_dt - now).total_seconds() < 900):
+        logging.info(f"Визит #{appointment_id} уже начался или до него осталось менее 15 мин — 1ч напоминание пропущено.")
         return
 
     branch = bs.get_branches().get(app["branch_id"], {})
@@ -94,7 +120,7 @@ async def send_aftercare_and_nps(bot: Bot, appointment_id: int, force: bool = Fa
     if not force and not await _is_appointment_still_valid(app, allow_completed=True):
         logging.info(f"Запись #{appointment_id} была отменена — запрос отзыва НЕ отправляется.")
         return
-    if not app:
+    if not _has_valid_telegram_id(app):
         return
 
     if not await db.has_review_for_appointment(appointment_id):
@@ -116,8 +142,22 @@ async def send_repeat_reminder(bot: Bot, appointment_id: int, force: bool = Fals
     app = await db.get_appointment_by_id(appointment_id)
     if not force and not await _is_appointment_still_valid(app, allow_completed=True):
         return
-    if not app:
+    if not _has_valid_telegram_id(app):
         return
+
+    if not force:
+        active_apps = await db.get_user_active_appointments(app["telegram_id"])
+        if active_apps:
+            logging.info(f"У клиента {app['telegram_id']} уже есть активная запись — повторное напоминание #{appointment_id} пропущено.")
+            return
+
+        last_comp = await db.get_last_completed_appointment(app["telegram_id"])
+        if last_comp and last_comp.get("id") != appointment_id:
+            last_dt = f"{last_comp['visit_date']} {db.normalize_time_str(last_comp['visit_time'])}"
+            curr_dt = f"{app['visit_date']} {db.normalize_time_str(app['visit_time'])}"
+            if last_dt > curr_dt:
+                logging.info(f"У клиента {app['telegram_id']} уже был более свежий визит #{last_comp['id']} — повторное напоминание #{appointment_id} пропущено.")
+                return
 
     days = await db.get_repeat_days(app.get("cat_id", "hair_removal"))
     try:
@@ -125,7 +165,7 @@ async def send_repeat_reminder(bot: Bot, appointment_id: int, force: bool = Fals
             bot,
             chat_id=app["telegram_id"],
             step_key="rem_repeat",
-            reply_markup=ikb.repeat_booking_kb(),
+            reply_markup=ikb.repeat_booking_kb(has_past_visit=True),
             days=days,
             service_title=app["service_title"],
             master_name=app["master_name"],
@@ -143,11 +183,11 @@ def remove_appointment_reminders(appointment_id: int):
 
 
 async def schedule_appointment_reminders(bot: Bot, appointment_id: int):
-    app = await db.get_appointment_by_id(appointment_id)
-    if not app or app["status"] not in ("active", "completed"):
-        return
-
     remove_appointment_reminders(appointment_id)
+
+    app = await db.get_appointment_by_id(appointment_id)
+    if not _has_valid_telegram_id(app) or app["status"] not in ("active", "completed"):
+        return
 
     time_parts = str(app["visit_time"]).split(":")
     norm_time = f"{int(time_parts[0]):02d}:{int(time_parts[1]):02d}"

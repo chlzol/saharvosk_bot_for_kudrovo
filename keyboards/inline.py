@@ -271,6 +271,8 @@ def masters_kb(masters: list[dict], page: int = 1, page_size: int = 6) -> Inline
 
 def calendar_kb(year: int, month: int, api_dates: list[str] | None = None) -> InlineKeyboardMarkup:
     allowed_months = get_allowed_months()
+    if month not in MONTH_NAMES:
+        year, month = allowed_months[0]
     available_dates = set(get_available_dates_in_month(year, month, api_dates=api_dates))
 
     keyboard = [
@@ -352,14 +354,15 @@ def appointment_manage_kb(
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-def reminder_24h_kb(appointment_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✨ Подтверждаю визит", callback_data=f"confirm_visit:{appointment_id}")],
-        [
-            InlineKeyboardButton(text="↺ Перенести", callback_data=f"reschedule_app:{appointment_id}"),
-            InlineKeyboardButton(text="✕ Отменить", callback_data=f"cancel_app:{appointment_id}")
-        ]
+def reminder_24h_kb(appointment_id: int, is_confirmed: bool = False) -> InlineKeyboardMarkup:
+    buttons = []
+    if not is_confirmed:
+        buttons.append([InlineKeyboardButton(text="✨ Подтверждаю визит", callback_data=f"confirm_visit:{appointment_id}")])
+    buttons.append([
+        InlineKeyboardButton(text="↺ Перенести", callback_data=f"reschedule_app:{appointment_id}"),
+        InlineKeyboardButton(text="✕ Отменить", callback_data=f"cancel_app:{appointment_id}")
     ])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 def repeat_booking_kb(has_past_visit: bool = False) -> InlineKeyboardMarkup:
