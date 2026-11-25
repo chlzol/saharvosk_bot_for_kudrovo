@@ -849,7 +849,7 @@ async def collect_system_status(
     header = (
         f"🩺 <b>Статус систем · Sahar&amp;Vosk</b>\n"
         f"<i>Обновлено: {now.strftime('%d.%m.%Y %H:%M:%S')} МСК</i>\n"
-        f"────────────────────\n"
+        f"──────────────\n"
     )
     body = "\n\n".join([sec1, sec2, sec3, sec4, sec5, sec6, sec7])
     report = sanitize_secrets(header + body)
@@ -865,13 +865,13 @@ def get_recent_errors_text() -> str:
     if not records:
         return (
             "🚨 <b>Журнал ошибок и предупреждений · Sahar&amp;Vosk</b>\n"
-            "────────────────────\n"
+            "──────────────\n"
             "Ошибок и предупреждений с момента запуска нет ✅"
         )
 
     header = (
         f"🚨 <b>Журнал ошибок · Sahar&amp;Vosk</b> (в буфере: <code>{len(records)}</code> | с запуска: <code>{warn_cnt}</code> warn / <code>{err_cnt}</code> err)\n"
-        "────────────────────"
+        "──────────────"
     )
     suffix = "\n<i>…журнал сокращён до лимита Telegram</i>"
     acc = [header]

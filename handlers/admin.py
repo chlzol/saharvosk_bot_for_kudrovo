@@ -235,7 +235,7 @@ async def send_to_archive_group(
             f"📥 <b>КЛИЕНТ ➡️ Sahar&Vosk ({html.escape(branch_title)})</b>\n"
             f"🔎 Профиль: #id{client_id}\n"
             f"👤 <b>{html.escape(client_name)}</b>{html.escape(user_tag)}{phone_str}\n"
-            f"────────────────────\n"
+            f"──────────────\n"
             f"🆔 <code>{client_id}</code> · <b>{html.escape(client_name)}:</b> "
         )
     else:
@@ -244,7 +244,7 @@ async def send_to_archive_group(
             f"📍 Студия: Sahar&Vosk ({html.escape(branch_title)})\n"
             f"🔎 Профиль: #id{client_id}\n"
             f"👤 Кому: <b>{html.escape(client_name)}</b>{html.escape(user_tag)}{phone_str}\n"
-            f"────────────────────\n"
+            f"──────────────\n"
             f"🆔 <code>{client_id}</code> · <b>Ответ:</b> "
         )
 
@@ -438,14 +438,14 @@ async def build_admin_dashboard_text() -> tuple[str, int]:
 
     text = (
         "✨ **Панель управления · Sahar&Vosk**\n"
-        "────────────────────\n"
+        "──────────────\n"
         f"👥 **Клиентов в базе:** {stats['total_users']}\n"
         f"💬 **Ожидают ответа:** {stats['unread_chats']}\n"
         f"🛡 **Администраторов:** {len(all_admins)}\n"
         f"📅 **Активных записей:** {stats['active_apps']}\n"
         f"  ├ 📍 Пражская, 3: {stats['prazhskaya_apps']} *(архив: {'✓' if grp_pr else '✕ не привязан'})*\n"
         f"  └ 📍 Ленинградская, 7: {stats['leningradskaya_apps']} *(архив: {'✓' if grp_len else '✕ не привязан'})*\n"
-        "────────────────────\n"
+        "──────────────\n"
         "Выберите действие для управления студией:"
     )
     return text, stats["unread_chats"]
@@ -469,7 +469,7 @@ async def cb_admin_sync_yclients(call: CallbackQuery, state: FSMContext | None =
         await _safe_admin_edit_md(
             call.message,
             "🔄 **Синхронизация каталога Sahar&Vosk с YCLIENTS...**\n"
-            "────────────────────\n"
+            "──────────────\n"
             "Обновляю услуги, цены, реальную длительность и привязки специалистов по обоим филиалам.\n\n"
             "⏳ Пожалуйста, подождите несколько секунд…"
         )
@@ -479,11 +479,11 @@ async def cb_admin_sync_yclients(call: CallbackQuery, state: FSMContext | None =
             dash_text, unread = await build_admin_dashboard_text()
             result_text = (
                 "✨ **Синхронизация успешно завершена!**\n"
-                "────────────────────\n"
+                "──────────────\n"
                 f"📍 **Пражская, 3:** {sync_stats['prazh_services']} услуг · {sync_stats['prazh_masters']} специалистов\n"
                 f"📍 **Ленинградская, 7:** {sync_stats['len_services']} услуг · {sync_stats['len_masters']} специалистов\n"
                 f"📂 **Всего в каталоге:** {sync_stats['total_services']} процедур и {sync_stats['total_masters']} специалистов.\n\n"
-                "────────────────────\n" + dash_text
+                "──────────────\n" + dash_text
             )
             await _safe_admin_edit_md(
                 call.message,
@@ -538,7 +538,7 @@ async def cb_admin_export_catalog(call: CallbackQuery, state: FSMContext | None 
         document=doc,
         caption=(
             "📄 **Полный каталог процедур сети Sahar&Vosk**\n"
-            "────────────────────\n"
+            "──────────────\n"
             "Выгрузка содержит перечень всех услуг, цен, длительностей и привязанных специалистов по обеим студиям."
         ),
         parse_mode="Markdown"
@@ -555,7 +555,7 @@ async def cb_admin_support_menu(call: CallbackQuery, state: FSMContext | None = 
     await _safe_admin_edit_md(
         call.message,
         "💬 **Центр сообщений и диалогов · Sahar&Vosk**\n"
-        "────────────────────\n"
+        "──────────────\n"
         f"🔴 **Ожидают ответа:** {unread_count}\n\n"
         "Выберите нужную категорию переписок:",
         reply_markup=ikb.admin_support_menu_kb(unread_count)
@@ -611,7 +611,7 @@ async def open_client_chat_for_admin(target_message: Message, state: FSMContext,
     history_lines = [
         f"💬 <b>Диалог: {html.escape(thread['client_name'] or 'Гость')}{html.escape(user_tag)}</b>",
         f"📍 <b>Студия:</b> Sahar&Vosk ({html.escape(branch_title)}) · ID: <code>{client_id}</code>{phone_line}",
-        "────────────────────"
+        "──────────────"
     ]
 
     photos_to_duplicate = []
@@ -634,7 +634,7 @@ async def open_client_chat_for_admin(target_message: Message, state: FSMContext,
             msg_blocks.pop(0)
         history_lines.extend(msg_blocks)
 
-    history_lines.append("────────────────────")
+    history_lines.append("──────────────")
     history_lines.append(
         "✨ <b>Прямое подключение к диалогу</b>\n"
         "Отправленные вами сообщения и фотографии поступают клиенту в личные сообщения бота.\n"
@@ -808,7 +808,7 @@ async def cb_admin_clear_cache_ask(call: CallbackQuery, state: FSMContext | None
     await _safe_admin_edit_md(
         call.message,
         "🧹 **Очистка тестового кэша**\n"
-        "────────────────────\n"
+        "──────────────\n"
         "Будут удалены тестовые записи, оценки и переписки внутри бота.\n"
         "База CRM YCLIENTS останется нетронутой.\n\n"
         "Подтверждаете действие?",
@@ -859,7 +859,7 @@ async def cb_admin_steps_groups(call: CallbackQuery, state: FSMContext | None = 
     await _safe_admin_edit_md(
         call.message,
         "🎨 **Редактор экранов, категорий и фото · Sahar&Vosk**\n"
-        "────────────────────\n"
+        "──────────────\n"
         f"Всего экранов в боте: **{total_all}** *(с изображениями: {total_pics})*\n\n"
         "Выберите раздел, который хотите настроить:",
         reply_markup=ikb.admin_step_groups_kb(counts),
@@ -886,7 +886,7 @@ async def cb_admin_steps_in_group(call: CallbackQuery, state: FSMContext | None 
     await _safe_admin_edit_md(
         call.message,
         f"🎨 **{grp_title}**\n"
-        "────────────────────\n"
+        "──────────────\n"
         "Значком 🖼 отмечены экраны, к которым уже прикреплено фото.\n"
         "Выберите экран для редактирования текста или загрузки фотографии:",
         reply_markup=ikb.admin_steps_list_kb(steps, group=group, page=page),
@@ -912,7 +912,7 @@ async def cb_admin_step_card(call: CallbackQuery, state: FSMContext | None = Non
 
     text = (
         f"⚙️ <b>Настройка: {escaped_title}</b>\n"
-        "────────────────────\n"
+        "──────────────\n"
         f"🖼 <b>Изображение:</b> {photo_status}\n\n"
         f"📝 <b>Текущий текст:</b>\n"
         f"<pre>{escaped_text}</pre>\n"
@@ -943,7 +943,7 @@ async def cb_admin_edit_step_text(call: CallbackQuery, state: FSMContext | None 
 
     text = (
         f"✏️ <b>Редактирование: «{escaped_title}»</b>\n"
-        "────────────────────\n"
+        "──────────────\n"
         "Нажмите на блок ниже, чтобы скопировать текущий текст, внесите изменения и отправьте в ответ:\n\n"
         f"<code>{escaped_text}</code>\n\n"
         f"💡 <b>Доступные переменные:</b>\n<code>{escaped_hints}</code>"
@@ -1025,7 +1025,7 @@ async def process_edited_step_text(message: Message, state: FSMContext):
     await message.answer(
         db._clip_utf16(
             f"✓ <b>Текст «{html.escape(step['title'])}» обновлён!</b>\n"
-            "────────────────────\n"
+            "──────────────\n"
             f"🖼 <b>Изображение:</b> {photo_status}\n\n"
             f"📝 <b>Новый текст:</b>\n<pre>{_clip_html_preview(step['custom_text'])}</pre>"
             f"{warn_html}",
@@ -1052,7 +1052,7 @@ async def cb_admin_reset_step_text(call: CallbackQuery, state: FSMContext | None
     await _safe_admin_edit_html(
         call.message,
         f"⚙️ <b>Настройка: {html.escape(step['title'])}</b>\n"
-        "────────────────────\n"
+        "──────────────\n"
         f"🖼 <b>Изображение:</b> {photo_status}\n\n"
         f"📝 <b>Текущий текст:</b>\n<pre>{_clip_html_preview(step['custom_text'])}</pre>",
         reply_markup=ikb.admin_step_actions_kb(step_key, bool(step.get("photo_id")), group=group),
@@ -1081,7 +1081,7 @@ async def cb_admin_edit_step_photo(call: CallbackQuery, state: FSMContext | None
     await _safe_admin_edit_md(
         call.message,
         f"🖼 **Изображение для экрана: «{escape_md(step['title'])}»**\n"
-        f"────────────────────\n"
+        f"──────────────\n"
         f"{status_line}{max_note}\n\n"
         "Отправьте фотографию в чат, чтобы закрепить её за этим экраном:",
         reply_markup=ikb.admin_edit_photo_kb(step_key, has_photo),
@@ -1127,7 +1127,7 @@ async def process_edited_step_photo(message: Message, state: FSMContext):
     await message.answer(
         db._clip_utf16(
             f"✓ <b>Изображение для экрана «{html.escape(step['title'])}» сохранено!</b>\n"
-            "────────────────────\n"
+            "──────────────\n"
             f"🖼 <b>Изображение:</b> ✓ Прикреплено\n\n"
             f"📝 <b>Текущий текст:</b>\n<pre>{_clip_html_preview(step['custom_text'])}</pre>"
             f"{max_warn}",
@@ -1153,7 +1153,7 @@ async def cb_admin_delete_step_photo(call: CallbackQuery, state: FSMContext | No
     await _safe_admin_edit_html(
         call.message,
         f"⚙️ <b>Настройка: {html.escape(step['title'])}</b>\n"
-        "────────────────────\n"
+        "──────────────\n"
         f"🖼 <b>Изображение:</b> ✕ Отсутствует\n\n"
         f"📝 <b>Текущий текст:</b>\n<pre>{_clip_html_preview(step['custom_text'])}</pre>",
         reply_markup=ikb.admin_step_actions_kb(step_key, False, group=group),
@@ -1223,7 +1223,7 @@ async def build_admins_view(current_admin_id: int | None = None):
     db_admins = await db.get_db_admins()
     lines = [
         "👥 **Управление доступом администраторов**\n"
-        "────────────────────\n"
+        "──────────────\n"
     ]
     lines.append("👑 **Главные администраторы (.env):**")
     for env_id in ADMIN_IDS:
@@ -1249,7 +1249,7 @@ async def cb_admin_start_add_admin(call: CallbackQuery, state: FSMContext | None
     await _safe_admin_edit_md(
         call.message,
         "＋ **Назначение администратора**\n"
-        "────────────────────\n"
+        "──────────────\n"
         "Отправьте **Telegram ID** (например: `123456789 Мария`), перешлите сообщение от пользователя или отправьте контакт:",
         reply_markup=ikb.admin_cancel_input_kb("adm:admins"),
     )
@@ -1325,7 +1325,7 @@ async def cb_admin_apps_menu(call: CallbackQuery, state: FSMContext | None = Non
     await _safe_admin_edit_md(
         call.message,
         "📋 **Журнал активных записей · Sahar&Vosk**\n"
-        "────────────────────\n"
+        "──────────────\n"
         "Выберите студию для просмотра предстоящих бронирований:",
         reply_markup=ikb.admin_branches_filter_kb(),
     )
@@ -1358,7 +1358,7 @@ async def cb_admin_show_apps(call: CallbackQuery, state: FSMContext | None = Non
     lines = [
         f"✨ <b>Активные записи · Sahar&Vosk ({len(apps)} шт.)</b>",
         f"<i>Страница {page} из {total_pages}</i>",
-        "────────────────────\n"
+        "──────────────\n"
     ]
     buttons = []
 
@@ -1431,7 +1431,7 @@ async def cb_admin_cancel_app(call: CallbackQuery, state: FSMContext | None = No
         formatted_date = date.fromisoformat(app["visit_date"]).strftime("%d.%m.%Y")
         cancel_notice = (
             f"✨ **Уведомление от студии Sahar&Vosk**\n"
-            f"────────────────────\n"
+            f"──────────────\n"
             f"Ваш визит №{app_id} на {formatted_date} в {app['visit_time']} "
             f"({escape_md(app['service_title'])}) был отменён администратором студии.\n\n"
             "Будем рады подобрать для вас другое удобное время онлайн или по телефону."
@@ -1466,7 +1466,7 @@ async def cb_admin_repeat_settings(call: CallbackQuery, state: FSMContext | None
     await _safe_admin_edit_md(
         call.message,
         "⏳ **Интервалы приглашения на повторный визит**\n"
-        "────────────────────\n"
+        "──────────────\n"
         "Выберите направление, чтобы скорректировать срок отправки уведомления:",
         reply_markup=ikb.admin_repeat_settings_kb(REPEAT_CATEGORIES, settings),
     )
@@ -1535,7 +1535,7 @@ async def cb_admin_broadcast_start(call: CallbackQuery, state: FSMContext | None
     await _safe_admin_edit_md(
         call.message,
         "📢 **Создание рассылки · Sahar&Vosk**\n"
-        "────────────────────\n"
+        "──────────────\n"
         "Выберите целевую аудиторию получателей:",
         reply_markup=ikb.admin_segments_kb(),
     )
@@ -1560,7 +1560,7 @@ async def cb_admin_select_segment(call: CallbackQuery, state: FSMContext):
         call.message,
         f"📢 **Создание рассылки**\n"
         f"🎯 **Сегмент:** {seg_title} ({len(recipients)} чел.)\n"
-        "────────────────────\n"
+        "──────────────\n"
         "Отправьте текст сообщения или фотографию с подписью:",
         reply_markup=ikb.admin_cancel_input_kb("adm:broadcast"),
     )
@@ -1680,7 +1680,7 @@ async def cb_admin_send_broadcast(call: CallbackQuery, state: FSMContext):
         try:
             await call.message.answer(
                 f"✨ **Рассылка завершена!**\n"
-                f"────────────────────\n"
+                f"──────────────\n"
                 f"Успешно доставлено: **{sent}** | Ошибок: **{failed}**",
                 reply_markup=ikb.admin_main_kb(unread),
                 parse_mode="Markdown"

@@ -266,7 +266,7 @@ async def send_calendar_ics_file(call: CallbackQuery):
         document=doc,
         caption=(
             f"📅 **Файл календаря · Sahar&Vosk (Запись №{app_id})**\n"
-            f"────────────────────\n"
+            f"──────────────\n"
             "Нажмите на файл выше, чтобы добавить визит в Apple Calendar, Samsung Calendar или Outlook "
             "(включая автоматическое напоминание за 2 часа до визита)."
         ),
@@ -378,7 +378,7 @@ async def process_negative_nps_feedback(message: Message, state: FSMContext):
         stars_str = "⭐️" * rating
         alert_text = (
             f"🚨 **Контроль качества · Sahar&Vosk: {stars_str} ({rating}/5)**\n"
-            f"────────────────────\n"
+            f"──────────────\n"
             f"📍 **Студия:** {escape_md(branch_title)}\n"
             f"👤 **Клиент:** {escape_md(app['client_name'])} (`{app['phone']}`)\n"
             f"✨ **Услуга:** {escape_md(app['service_title'])} (Запись №{app_id})\n"
@@ -724,7 +724,7 @@ async def confirm_user_visit(call: CallbackQuery):
         await _safe_edit_message(
             call,
             f"✨ **Ваш визит №{app_id} подтверждён!**\n"
-            "────────────────────\n"
+            "──────────────\n"
             "С нетерпением ждём вас в студии **Sahar&Vosk** 🤍"
         )
         await call.answer("Визит подтверждён! ✨")
@@ -776,7 +776,7 @@ async def cancel_user_appointment(call: CallbackQuery):
         await notify_admins(
             call.bot,
             f"✕ **Отмена записи клиентом (№{app_id}) · Sahar&Vosk**\n"
-            f"────────────────────\n"
+            f"──────────────\n"
             f"📍 Студия: {escape_md(app['branch_title'])}\n"
             f"👤 Клиент: {escape_md(app['client_name'])} (`{app['phone']}`)\n"
             f"✨ Услуги: {escape_md(app['service_title'])}\n"
@@ -2264,7 +2264,7 @@ async def finalize_booking(call: CallbackQuery, state: FSMContext):
                 await notify_admins(
                     call.bot,
                     f"{header_title} {crm_badge}\n"
-                    f"────────────────────\n"
+                    f"──────────────\n"
                     f"📍 **Студия:** {escape_md(branch.get('title', data['branch_id']))}\n"
                     f"👤 **Клиент:** {escape_md(data['client_name'])} ({user_link})\n"
                     f"📞 **Телефон:** `{data['phone']}`\n"

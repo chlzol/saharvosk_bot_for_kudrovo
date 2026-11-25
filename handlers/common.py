@@ -143,7 +143,7 @@ async def cb_send_branch_geolocation(call: CallbackQuery):
     ])
     await call.message.answer(
         f"✨ **Sahar&Vosk · {branch['title']}**\n"
-        f"────────────────────\n"
+        f"──────────────\n"
         f"📍 Адрес: {branch['address']}\n"
         f"🕒 Ежедневно: 10:00 – 22:00\n"
         f"📞 Телефон: `{branch['phone']}`",
@@ -244,7 +244,7 @@ async def forward_client_message_to_admins_and_archive(message: Message, branch_
     safe_msg_text = escape_md(text) if text else "[Изображение]"
     admin_alert_text = (
         f"📩 **Новое обращение · Sahar&Vosk**\n"
-        f"────────────────────\n"
+        f"──────────────\n"
         f"📍 **Студия:** {escape_md(branch_title)}\n"
         f"👤 **Клиент:** {escape_md(client_name)}{user_link} (`{message.from_user.id}`)\n\n"
         f"💬 {safe_msg_text}"
