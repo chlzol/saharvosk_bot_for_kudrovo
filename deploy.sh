@@ -29,7 +29,7 @@ echo "✓ Часовой пояс: $(timedatectl | grep 'Time zone' || date)"
 echo "📦 Обновление пакетов и установка системных утилит..."
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
-apt-get install -y python3 python3-venv python3-pip sqlite3 git curl
+apt-get install -y python3 python3-venv python3-pip sqlite3 git curl rsync
 
 # 4. Проверка доступности внешних шлюзов Telegram API и YCLIENTS API
 echo "🌐 Проверка сетевого доступа к шлюзам Telegram и YCLIENTS..."
@@ -61,16 +61,55 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [ "$SCRIPT_DIR" != "$APP_DIR" ]; then
     echo "📂 Синхронизация файлов проекта в ${APP_DIR}..."
     mkdir -p "$APP_DIR"
-    # Исключаем временные файлы, виртуальное окружение и бэкапы при синхронизации
+    # Исключаем локальные секреты, БД, сессию MAX, виртуальное окружение и бэкапы при синхронизации
     if command -v rsync >/dev/null 2>&1; then
-        rsync -av --exclude='.venv' --exclude='venv' --exclude='__pycache__' --exclude='backups' "${SCRIPT_DIR}/" "${APP_DIR}/"
+        rsync -av \
+            --exclude='.git' \
+            --exclude='.venv' \
+            --exclude='venv' \
+            --exclude='env' \
+            --exclude='__pycache__' \
+            --exclude='backups' \
+            --exclude='.env' \
+            --exclude='.env.local' \
+            --exclude='.env.*.local' \
+            --exclude='*.db' \
+            --exclude='*.db-wal' \
+            --exclude='*.db-shm' \
+            --exclude='*.db-journal' \
+            --exclude='*.sqlite3' \
+            --exclude='max_session*' \
+            --exclude='.idea' \
+            --exclude='.vscode' \
+            --exclude='*.log' \
+            "${SCRIPT_DIR}/" "${APP_DIR}/"
     else
-        cp -r "${SCRIPT_DIR}/." "${APP_DIR}/"
+        tar -C "$SCRIPT_DIR" \
+            --exclude='./.git' \
+            --exclude='./.venv' \
+            --exclude='./venv' \
+            --exclude='./env' \
+            --exclude='__pycache__' \
+            --exclude='./backups' \
+            --exclude='./.env' \
+            --exclude='./.env.local' \
+            --exclude='./.env.*.local' \
+            --exclude='*.db' \
+            --exclude='*.db-wal' \
+            --exclude='*.db-shm' \
+            --exclude='*.db-journal' \
+            --exclude='*.sqlite3' \
+            --exclude='max_session*' \
+            --exclude='./.idea' \
+            --exclude='./.vscode' \
+            --exclude='*.log' \
+            -cf - . | tar -C "$APP_DIR" -xf -
     fi
 fi
 
 cd "$APP_DIR"
 mkdir -p "$BACKUP_DIR"
+chmod 700 "$BACKUP_DIR"
 
 # 6. Виртуальное окружение и зависимости Python
 echo "🐍 Настройка виртуального окружения Python..."
@@ -83,7 +122,7 @@ echo "📥 Установка / обновление библиотек из req
 "${APP_DIR}/.venv/bin/pip" install --upgrade pip
 "${APP_DIR}/.venv/bin/pip" install -r "${APP_DIR}/requirements.txt"
 
-# 7. Проверка конфигурации .env
+# 7. Проверка конфигурации .env и прав доступа к чувствительным файлам
 ENV_READY=true
 if [ ! -f "${APP_DIR}/.env" ]; then
     if [ -f "${APP_DIR}/.env.example" ]; then
@@ -93,7 +132,6 @@ if [ ! -f "${APP_DIR}/.env" ]; then
         touch "${APP_DIR}/.env"
         echo "⚠️ Создан пустой .env"
     fi
-    chmod 600 "${APP_DIR}/.env"
     ENV_READY=false
 else
     # Проверяем, заменён ли дефолтный BOT_TOKEN
@@ -101,26 +139,38 @@ else
         ENV_READY=false
     fi
 fi
+chmod 600 "${APP_DIR}/.env"
+
+# Принудительно закрываем права на БД и сессии MAX (идемпотентно при каждом запуске)
+for db_artifact in "${APP_DIR}"/saharvosk.db "${APP_DIR}"/saharvosk.db-wal "${APP_DIR}"/saharvosk.db-shm; do
+    if [ -f "$db_artifact" ]; then
+        chmod 600 "$db_artifact"
+    fi
+done
+find "$APP_DIR" -maxdepth 1 -name "max_session*" -exec chmod u=rwX,go= {} + 2>/dev/null || true
 
 # 8. Настройка ночного горячего бэкапа SQLite (через cron)
 echo "💾 Настройка ежедневного ночного бэкапа базы данных..."
 cat > "$BACKUP_SCRIPT" << 'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
 APP_DIR="/opt/saharvosk_bot_for_kudrovo"
 BACKUP_DIR="${APP_DIR}/backups"
 DB_FILE="${APP_DIR}/saharvosk.db"
-DATE_STR=$(date +%Y-%m-%d_%H-%M)
+DATE_STR=$(date +%Y-%m-%d_%H-%M-%S)
 
 if [ -f "$DB_FILE" ]; then
     mkdir -p "$BACKUP_DIR"
-    # Горячий консистентный бэкап SQLite (безопасен при открытом WAL-соединении)
-    sqlite3 "$DB_FILE" ".backup '${BACKUP_DIR}/saharvosk_${DATE_STR}.db'"
+    chmod 700 "$BACKUP_DIR"
+    # Горячий консистентный бэкап SQLite (безопасен при открытом WAL-соединении, ждёт до 25 сек при записи)
+    sqlite3 -cmd ".timeout 25000" "$DB_FILE" ".backup '${BACKUP_DIR}/saharvosk_${DATE_STR}.db'"
+    chmod 600 "${BACKUP_DIR}/saharvosk_${DATE_STR}.db"
     # Ротация: удаляем копии старше 14 дней
     find "$BACKUP_DIR" -type f -name "saharvosk_*.db" -mtime +14 -delete
 fi
 EOF
-chmod +x "$BACKUP_SCRIPT"
+chmod 700 "$BACKUP_SCRIPT"
 
 # Запуск каждую ночь в 03:30 по Москве
 cat > "$CRON_FILE" << EOF
@@ -139,6 +189,10 @@ if [ -f "${APP_DIR}/saharvosk.service" ]; then
     systemctl enable "${SERVICE_NAME}"
 
     if [ "$ENV_READY" = true ]; then
+        if [ -f "${APP_DIR}/saharvosk.db" ]; then
+            echo "💾 Выполняю горячий бэкап БД перед перезапуском сервиса..."
+            "$BACKUP_SCRIPT" || echo "⚠️ Предупреждение: не удалось сделать pre-deploy бэкап"
+        fi
         echo "🔄 Перезапуск службы ${SERVICE_NAME}..."
         systemctl restart "${SERVICE_NAME}"
         sleep 2

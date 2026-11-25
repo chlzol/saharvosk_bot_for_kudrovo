@@ -10,15 +10,23 @@
 from __future__ import annotations
 
 import asyncio
+import atexit
 import json
 import logging
 import random
+import threading
 import time
 from pathlib import Path
 from typing import Any
 
 import config
 from database import db
+
+try:
+    from websockets.exceptions import WebSocketException as _WebSocketException
+    _WS_EXTRA_EXCEPTIONS: tuple[type[BaseException], ...] = (_WebSocketException,)
+except Exception:
+    _WS_EXTRA_EXCEPTIONS = ()
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +36,17 @@ EXPIRED_ALERT_COOLDOWN_SEC = 6 * 3600  # Не чаще 1 раза в 6 часо�
 CONNECT_TIMEOUT_SEC = 20.0
 REQUEST_TIMEOUT_SEC = 15.0
 CLOSE_TIMEOUT_SEC = 5.0
+IDLE_RECONNECT_SEC = 1800.0  # Пересоздаём соединение после 30 мин простоя (защита от тихого обрыва NAT/WS)
+MAX_CLIENT_LIFETIME_SEC = 6 * 3600.0  # Периодический сброс внутреннего кэша pymax.App (users/messages)
+
+_WS_RECONNECT_ERRORS: tuple[type[BaseException], ...] = (
+    asyncio.TimeoutError,
+    TimeoutError,
+    ConnectionError,
+    EOFError,
+    OSError,
+    *_WS_EXTRA_EXCEPTIONS,
+)
 
 _EXPIRED_AUTH_CODES = {
     "FAIL_LOGIN_TOKEN",
@@ -40,11 +59,60 @@ _EXPIRED_AUTH_CODES = {
 
 _client: Any = None
 _client_loop: asyncio.AbstractEventLoop | None = None
+_client_created_monotonic: float = 0.0
+_last_client_activity_monotonic: float = 0.0
 _fallback_bot: Any = None
 _send_locks: dict[int, asyncio.Lock] = {}
 _connect_locks: dict[int, asyncio.Lock] = {}
 _last_send_monotonic: float = 0.0
 _last_expired_alert_at: float = 0.0
+
+_telemetry: dict[str, Any] = {
+    "sent_ok": 0,
+    "sent_failed": 0,
+    "not_found": 0,
+    "session_expired_count": 0,
+    "last_sent_at": None,
+    "last_error": None,
+}
+
+
+def _record_error_msg(msg: str) -> None:
+    txt = str(msg or "").strip()
+    if len(txt) > 180:
+        txt = txt[:177] + "..."
+    _telemetry["last_error"] = txt or None
+
+
+def get_max_telemetry() -> dict[str, Any]:
+    """Возвращает текущую диагностику и телеметрию клиента MAX (без секретов)."""
+    work_dir, session_name = resolve_session_location()
+    session_file = Path(work_dir) / session_name
+    meta = _load_auth_meta(work_dir, session_name)
+    backend = str(config.MAX_BACKEND or "ws").strip().lower()
+    if backend == "playwright":
+        pw_dir = resolve_playwright_profile_dir()
+        session_exists = pw_dir.exists()
+        session_size = 0
+    else:
+        session_exists = session_file.exists()
+        session_size = session_file.stat().st_size if session_exists else 0
+
+    lock_busy = any(l.locked() for l in _send_locks.values())
+    return {
+        "sent_ok": int(_telemetry["sent_ok"]),
+        "sent_failed": int(_telemetry["sent_failed"]),
+        "not_found": int(_telemetry["not_found"]),
+        "session_expired_count": int(_telemetry["session_expired_count"]),
+        "last_sent_at": _telemetry["last_sent_at"],
+        "last_error": _telemetry["last_error"],
+        "lock_busy": lock_busy,
+        "session_exists": session_exists,
+        "session_size_bytes": session_size,
+        "client_type": (meta or {}).get("client_type") or ("playwright" if backend == "playwright" else "auto"),
+        "auth_method": (meta or {}).get("auth_method"),
+        "is_connected": bool(_client is not None and getattr(_client, "is_connected", False)),
+    }
 
 
 class MaxSessionExpiredError(RuntimeError):
@@ -159,7 +227,7 @@ async def _load_saved_session_info(work_dir: str, session_name: str):
     try:
         return await store.load_session()
     finally:
-        await store.close()
+        await asyncio.shield(_close_store_safely(store))
 
 
 def _is_session_expired_error(exc: Exception) -> bool:
@@ -189,6 +257,8 @@ def _is_session_expired_error(exc: Exception) -> bool:
 async def _handle_expired_session(bot=None) -> None:
     """Логирует истечение сессии MAX и не чаще раза в 6 часов уведомляет админов в Telegram."""
     global _last_expired_alert_at
+    _telemetry["session_expired_count"] = int(_telemetry["session_expired_count"]) + 1
+    _record_error_msg("MAX session expired — run max_auth.py")
     logger.error("MAX session expired — run max_auth.py")
 
     target_bot = bot or _fallback_bot
@@ -247,7 +317,8 @@ async def _create_ws_client():
     if client_type not in ("client", "web_client"):
         stored_ua = getattr(session_info, "user_agent", None)
         device_type = getattr(stored_ua, "device_type", None)
-        if device_type == DeviceType.ANDROID or (stored_ua is None and bool(getattr(session_info, "phone", ""))):
+        dt_val = str(getattr(device_type, "value", device_type) or "").strip().upper()
+        if device_type == DeviceType.ANDROID or dt_val == "ANDROID" or (stored_ua is None and bool(getattr(session_info, "phone", ""))):
             client_type = "client"
         else:
             client_type = "web_client"
@@ -269,60 +340,254 @@ async def _create_ws_client():
     )
 
 
+def _get_pymax_app(client: Any) -> Any:
+    if client is None:
+        return None
+    if hasattr(client, "__dict__"):
+        app = client.__dict__.get("_BaseClient__app")
+        if app is not None:
+            return app
+    return None
+
+
+def _force_abort_transport(transport: Any) -> None:
+    if transport is None:
+        return
+    try:
+        ws = getattr(transport, "ws", None)
+        if ws is not None:
+            ws_tr = getattr(ws, "transport", None)
+            if ws_tr is not None and hasattr(ws_tr, "abort"):
+                ws_tr.abort()
+        writer = getattr(transport, "_writer", None)
+        if writer is not None:
+            w_tr = getattr(writer, "transport", None)
+            if w_tr is not None and hasattr(w_tr, "abort"):
+                w_tr.abort()
+            elif hasattr(writer, "close"):
+                writer.close()
+    except Exception:
+        pass
+
+
+def _force_stop_aiosqlite_conn(conn: Any) -> None:
+    """
+    Гарантированно останавливает рабочий non-daemon поток aiosqlite.Connection,
+    чтобы интерпретатор Python не зависал в threading._shutdown().
+    """
+    if conn is None:
+        return
+    try:
+        if hasattr(conn, "stop"):
+            conn.stop()
+    except Exception:
+        pass
+    try:
+        t = getattr(conn, "_thread", None)
+        if t is not None and t.is_alive() and t is not threading.current_thread():
+            t.join(timeout=2.0)
+    except Exception:
+        pass
+
+
+def _sync_cleanup_client(client: Any) -> None:
+    """Синхронная аварийная зачистка транспорта и aiosqlite-потока при остановке/выходе процесса."""
+    app = _get_pymax_app(client)
+    if app is None:
+        return
+    try:
+        conn_mgr = getattr(app, "connection", None)
+        if conn_mgr is not None:
+            _force_abort_transport(getattr(conn_mgr, "transport", None))
+    except Exception:
+        pass
+    try:
+        store = getattr(app, "store", None)
+        if store is not None:
+            conn = getattr(store, "conn", None)
+            if conn is not None:
+                _force_stop_aiosqlite_conn(conn)
+                store.conn = None
+    except Exception:
+        pass
+
+
+async def _close_store_safely(store: Any) -> None:
+    """Закрывает SessionStore и дожидается завершения рабочего non-daemon потока aiosqlite."""
+    if store is None:
+        return
+    conn_ref = getattr(store, "conn", None)
+    if conn_ref is None:
+        return
+    try:
+        await asyncio.wait_for(store.close(), timeout=2.0)
+    except BaseException:
+        _force_stop_aiosqlite_conn(conn_ref)
+        store.conn = None
+        return
+    t = getattr(conn_ref, "_thread", None)
+    if t is not None and t.is_alive() and t is not threading.current_thread():
+        try:
+            await asyncio.to_thread(t.join, 2.0)
+        except BaseException:
+            _force_stop_aiosqlite_conn(conn_ref)
+
+
+async def close_client_safely(client: Any) -> None:
+    """
+    Закрывает pymax-клиента с таймаутом и принудительно дочищает транспорт, задачи
+    и SessionStore (aiosqlite worker thread), даже если client.close() завис или отменён.
+    """
+    if client is None:
+        return
+    app = _get_pymax_app(client)
+    try:
+        await asyncio.wait_for(client.close(), timeout=CLOSE_TIMEOUT_SEC)
+    except (Exception, asyncio.CancelledError) as e:
+        logger.debug("Ошибка/таймаут штатного закрытия клиента MAX: %s", e)
+    finally:
+        if app is not None:
+            for task_attr in ("_ping_task",):
+                t = getattr(app, task_attr, None)
+                if t is not None and not t.done():
+                    t.cancel()
+            telem = getattr(app, "_telemetry", None)
+            if telem is not None:
+                tt = getattr(telem, "_task", None)
+                if tt is not None and not tt.done():
+                    tt.cancel()
+            conn_mgr = getattr(app, "connection", None)
+            if conn_mgr is not None:
+                rt = getattr(conn_mgr, "_recv_task", None)
+                if rt is not None and not rt.done():
+                    rt.cancel()
+                for et in tuple(getattr(conn_mgr, "_event_tasks", ()) or ()):
+                    if not et.done():
+                        et.cancel()
+                reqs = getattr(conn_mgr, "requests", None)
+                if reqs is not None and hasattr(reqs, "cancel_all"):
+                    try:
+                        reqs.cancel_all()
+                    except Exception:
+                        pass
+                _force_abort_transport(getattr(conn_mgr, "transport", None))
+            store = getattr(app, "store", None)
+            await _close_store_safely(store)
+
+
 async def close_max_client() -> None:
     """Безопасно закрывает активное соединение клиента MAX при завершении или пересоздании."""
-    global _client, _client_loop
+    global _client, _client_loop, _client_created_monotonic, _last_client_activity_monotonic
     client = _client
     _client = None
     _client_loop = None
+    _client_created_monotonic = 0.0
+    _last_client_activity_monotonic = 0.0
     if client is None:
         return
-    try:
-        await asyncio.wait_for(client.close(), timeout=CLOSE_TIMEOUT_SEC)
-    except Exception as e:
-        logger.debug("Ошибка закрытия клиента MAX: %s", e)
+    await close_client_safely(client)
+
+
+def _atexit_cleanup_max_client() -> None:
+    """Не даёт одноразовым CLI/тест-скриптам зависать на threading._shutdown из-за aiosqlite-потока."""
+    global _client, _client_loop, _client_created_monotonic, _last_client_activity_monotonic
+    client = _client
+    _client = None
+    _client_loop = None
+    _client_created_monotonic = 0.0
+    _last_client_activity_monotonic = 0.0
+    if client is not None:
+        _sync_cleanup_client(client)
+
+
+atexit.register(_atexit_cleanup_max_client)
+
+
+def _is_cached_client_healthy(client: Any, current_loop: asyncio.AbstractEventLoop) -> bool:
+    if client is None or _client_loop is not current_loop:
+        return False
+    if not getattr(client, "is_connected", False) or getattr(client, "me", None) is None:
+        return False
+
+    now_mono = time.monotonic()
+    if _last_client_activity_monotonic > 0 and (now_mono - _last_client_activity_monotonic) > IDLE_RECONNECT_SEC:
+        return False
+    if _client_created_monotonic > 0 and (now_mono - _client_created_monotonic) > MAX_CLIENT_LIFETIME_SEC:
+        return False
+
+    app = _get_pymax_app(client)
+    if app is not None:
+        if not getattr(app, "started", False):
+            return False
+        conn_mgr = getattr(app, "connection", None)
+        if conn_mgr is None or not getattr(conn_mgr, "is_open", False):
+            return False
+        transport = getattr(conn_mgr, "transport", None)
+        if transport is not None and not getattr(transport, "connected", False):
+            return False
+    return True
+
+
+def _is_connection_lost_runtime_error(exc: Exception) -> bool:
+    if not isinstance(exc, RuntimeError):
+        return False
+    low = str(exc).lower()
+    return (
+        "not connected" in low
+        or "closed" in low
+        or "not initialized" in low
+        or "connection lost" in low
+    )
 
 
 async def _ensure_connected_client():
-    global _client, _client_loop
+    global _client, _client_loop, _client_created_monotonic, _last_client_activity_monotonic
     current_loop = asyncio.get_running_loop()
     lock = _get_connect_lock()
 
     async with lock:
-        if (
-            _client is not None
-            and _client_loop is current_loop
-            and getattr(_client, "is_connected", False)
-            and getattr(_client, "me", None) is not None
-        ):
+        if _is_cached_client_healthy(_client, current_loop):
+            _last_client_activity_monotonic = time.monotonic()
             return _client
 
         await close_max_client()
         client = await _create_ws_client()
         try:
             await asyncio.wait_for(client.connect(), timeout=CONNECT_TIMEOUT_SEC)
-        except Exception:
+        except BaseException:
             try:
-                await asyncio.wait_for(client.close(), timeout=CLOSE_TIMEOUT_SEC)
+                await asyncio.shield(close_client_safely(client))
             except Exception:
-                pass
+                _sync_cleanup_client(client)
             raise
 
         me = getattr(client, "me", None)
         if not me or not getattr(me, "contact", None):
             try:
-                await asyncio.wait_for(client.close(), timeout=CLOSE_TIMEOUT_SEC)
+                await asyncio.shield(close_client_safely(client))
             except Exception:
-                pass
+                _sync_cleanup_client(client)
             raise MaxSessionExpiredError("MAX session login failed: profile not returned")
 
+        # Закрываем SQLite-соединение SessionStore сразу после connect()/login():
+        # токен уже сохранён на диск, дальнейшие RPC-запросы к store не обращаются
+        # (при необходимости _get_connection() откроет его лениво заново), зато
+        # не-демон рабочий поток aiosqlite не висит в фоне и не блокирует threading._shutdown().
+        app = _get_pymax_app(client)
+        store = getattr(app, "store", None) if app is not None else None
+        await _close_store_safely(store)
+
+        now_mono = time.monotonic()
         _client = client
         _client_loop = current_loop
+        _client_created_monotonic = now_mono
+        _last_client_activity_monotonic = now_mono
         return client
 
 
 async def _send_via_ws(norm_phone: str, text: str, bot=None) -> bool:
     """Отправляет сообщение через pymax WebSocket/TCP клиент по номеру телефона."""
+    global _last_client_activity_monotonic
     from pymax.exceptions import ApiError, PyMaxError
 
     for attempt in range(2):
@@ -331,11 +596,13 @@ async def _send_via_ws(norm_phone: str, text: str, bot=None) -> bool:
         except MaxSessionExpiredError:
             await _handle_expired_session(bot)
             return False
-        except (asyncio.TimeoutError, TimeoutError, ConnectionError, EOFError, OSError) as e:
+        except _WS_RECONNECT_ERRORS as e:
             logger.warning("MAX: таймаут/ошибка подключения к серверу (попытка %s/2): %s", attempt + 1, e)
             await close_max_client()
             if attempt == 0:
                 continue
+            _telemetry["sent_failed"] = int(_telemetry["sent_failed"]) + 1
+            _record_error_msg(f"Ошибка подключения MAX: {type(e).__name__}: {e}")
             return False
         except Exception as e:
             if _is_session_expired_error(e):
@@ -345,6 +612,8 @@ async def _send_via_ws(norm_phone: str, text: str, bot=None) -> bool:
             await close_max_client()
             if attempt == 0:
                 continue
+            _telemetry["sent_failed"] = int(_telemetry["sent_failed"]) + 1
+            _record_error_msg(f"Ошибка подключения MAX: {type(e).__name__}: {e}")
             return False
 
         try:
@@ -354,21 +623,36 @@ async def _send_via_ws(norm_phone: str, text: str, bot=None) -> bool:
                 await close_max_client()
                 await _handle_expired_session(bot)
                 return False
+            _telemetry["not_found"] = int(_telemetry["not_found"]) + 1
             logger.info("MAX: пользователь ***%s не найден по телефону или скрыт настройками (%s)", norm_phone[-4:], e)
             return False
         except PyMaxError as e:
+            _telemetry["not_found"] = int(_telemetry["not_found"]) + 1
             logger.info("MAX: контакт ***%s не найден в мессенджере (%s)", norm_phone[-4:], e)
             return False
-        except (asyncio.TimeoutError, TimeoutError, ConnectionError, EOFError, OSError) as e:
-            logger.warning("MAX: таймаут/обрыв при поиске ***%s (попытка %s/2): %s", norm_phone[-4:], attempt + 1, e)
+        except _WS_RECONNECT_ERRORS as e:
+            logger.warning("MAX: обрыв/таймаут при поиске ***%s (попытка %s/2): %s", norm_phone[-4:], attempt + 1, e)
             await close_max_client()
             if attempt == 0:
                 continue
+            _telemetry["sent_failed"] = int(_telemetry["sent_failed"]) + 1
+            _record_error_msg(f"Таймаут поиска MAX: {type(e).__name__}: {e}")
             return False
+        except Exception as e:
+            if _is_connection_lost_runtime_error(e):
+                logger.warning("MAX: потеряно соединение при поиске ***%s (попытка %s/2): %s", norm_phone[-4:], attempt + 1, e)
+                await close_max_client()
+                if attempt == 0:
+                    continue
+                _telemetry["sent_failed"] = int(_telemetry["sent_failed"]) + 1
+                _record_error_msg(f"Разрыв поиска MAX: {type(e).__name__}: {e}")
+                return False
+            raise
 
         user_id = getattr(user, "id", None) if user else None
         my_id = getattr(getattr(getattr(client, "me", None), "contact", None), "id", None)
         if not user_id or not my_id:
+            _telemetry["not_found"] = int(_telemetry["not_found"]) + 1
             logger.info("MAX: не удалось определить ID диалога для ***%s", norm_phone[-4:])
             return False
 
@@ -378,6 +662,7 @@ async def _send_via_ws(norm_phone: str, text: str, bot=None) -> bool:
                 client.send_message(chat_id=chat_id, text=text, notify=True),
                 timeout=REQUEST_TIMEOUT_SEC,
             )
+            _last_client_activity_monotonic = time.monotonic()
             logger.info("MAX: напоминание успешно отправлено на ***%s (chat_id=%s)", norm_phone[-4:], chat_id)
             return True
         except ApiError as e:
@@ -385,14 +670,28 @@ async def _send_via_ws(norm_phone: str, text: str, bot=None) -> bool:
                 await close_max_client()
                 await _handle_expired_session(bot)
                 return False
+            _telemetry["sent_failed"] = int(_telemetry["sent_failed"]) + 1
+            _record_error_msg(f"Ошибка API MAX: {e}")
             logger.warning("MAX: ошибка API при отправке на ***%s: %s", norm_phone[-4:], e)
             return False
-        except (asyncio.TimeoutError, TimeoutError, ConnectionError, EOFError, OSError) as e:
-            logger.warning("MAX: таймаут/обрыв при отправке ***%s (попытка %s/2): %s", norm_phone[-4:], attempt + 1, e)
+        except _WS_RECONNECT_ERRORS as e:
+            logger.warning("MAX: обрыв/таймаут при отправке ***%s (попытка %s/2): %s", norm_phone[-4:], attempt + 1, e)
             await close_max_client()
             if attempt == 0:
                 continue
+            _telemetry["sent_failed"] = int(_telemetry["sent_failed"]) + 1
+            _record_error_msg(f"Таймаут отправки MAX: {type(e).__name__}: {e}")
             return False
+        except Exception as e:
+            if _is_connection_lost_runtime_error(e):
+                logger.warning("MAX: потеряно соединение при отправке ***%s (попытка %s/2): %s", norm_phone[-4:], attempt + 1, e)
+                await close_max_client()
+                if attempt == 0:
+                    continue
+                _telemetry["sent_failed"] = int(_telemetry["sent_failed"]) + 1
+                _record_error_msg(f"Разрыв отправки MAX: {type(e).__name__}: {e}")
+                return False
+            raise
 
     return False
 
@@ -479,6 +778,117 @@ async def _wait_anti_spam_slot() -> None:
         await asyncio.sleep(remaining)
 
 
+async def check_max_connection(active_ping: bool = False) -> dict[str, Any]:
+    """
+    Проверяет наличие файлов сессии MAX (session.db + *.meta.json) и, при active_ping=True,
+    выполняет лёгкое подключение/отключение pymax под asyncio.wait_for(timeout=15) без отправки сообщений.
+    """
+    work_dir, session_name = resolve_session_location()
+    session_file = Path(work_dir) / session_name
+    meta_file = _meta_file_path(work_dir, session_name)
+    meta = _load_auth_meta(work_dir, session_name)
+    backend = str(config.MAX_BACKEND or "ws").strip().lower()
+
+    if backend == "playwright":
+        pw_dir = resolve_playwright_profile_dir()
+        session_exists = pw_dir.exists()
+        result: dict[str, Any] = {
+            "ok": session_exists,
+            "backend": backend,
+            "session_exists": session_exists,
+            "session_size_bytes": 0,
+            "meta_exists": False,
+            "client_type": "playwright",
+            "auth_method": "playwright",
+            "live_checked": active_ping,
+            "latency_ms": None,
+            "account_id": None,
+            "error": None if session_exists else "Профиль Playwright не найден",
+            "note": "Проверка браузера без запуска headless-окна" if active_ping else None,
+        }
+        return result
+
+    session_exists = session_file.exists()
+    session_size = session_file.stat().st_size if session_exists else 0
+    meta_exists = meta_file.exists()
+    client_type = (meta or {}).get("client_type") or "auto"
+    auth_method = (meta or {}).get("auth_method")
+
+    result = {
+        "ok": session_exists,
+        "backend": backend,
+        "session_exists": session_exists,
+        "session_size_bytes": session_size,
+        "meta_exists": meta_exists,
+        "client_type": client_type,
+        "auth_method": auth_method,
+        "live_checked": False,
+        "latency_ms": None,
+        "account_id": None,
+        "error": None if session_exists else "Файл сессии отсутствует (запустите max_auth.py)",
+        "note": None,
+    }
+    if not active_ping:
+        return result
+
+    result["live_checked"] = True
+    if not session_exists:
+        return result
+
+    if any(l.locked() for l in _send_locks.values()):
+        result["live_checked"] = False
+        result["ok"] = session_exists
+        result["note"] = "Активна очередь отправки — пинг отложен, чтобы не мешать"
+        return result
+
+    async def _do_live_ping() -> dict[str, Any]:
+        send_lock = _get_send_lock()
+        async with send_lock:
+            connect_lock = _get_connect_lock()
+            async with connect_lock:
+                await close_max_client()
+                t0 = time.monotonic()
+                temp_client = await _create_ws_client()
+                try:
+                    await temp_client.connect()
+                    me = getattr(temp_client, "me", None)
+                    contact = getattr(me, "contact", None)
+                    acc_id = getattr(contact, "id", None)
+                    latency_ms = round((time.monotonic() - t0) * 1000.0, 1)
+                    result["ok"] = bool(acc_id)
+                    result["latency_ms"] = latency_ms
+                    result["account_id"] = acc_id
+                    if acc_id:
+                        _telemetry["last_error"] = None
+                    else:
+                        result["error"] = "Профиль MAX не получен"
+                    return result
+                finally:
+                    try:
+                        await asyncio.shield(close_client_safely(temp_client))
+                    except Exception:
+                        _sync_cleanup_client(temp_client)
+
+    try:
+        return await asyncio.wait_for(_do_live_ping(), timeout=15.0)
+    except MaxSessionExpiredError:
+        result["ok"] = False
+        result["error"] = "Сессия истекла — запустите max_auth.py"
+        return result
+    except asyncio.TimeoutError:
+        result["ok"] = False
+        result["error"] = "Таймаут подключения к MAX (15с)"
+        return result
+    except Exception as e:
+        if _is_session_expired_error(e):
+            result["ok"] = False
+            result["error"] = "Сессия истекла — запустите max_auth.py"
+        else:
+            result["ok"] = False
+            result["error"] = f"{type(e).__name__}: {str(e)[:120]}"
+        return result
+
+
 async def send_max_reminder(phone: str, text: str, bot=None) -> bool:
     """
     Отправляет одиночное текстовое напоминание о визите пользователю мессенджера MAX.
@@ -496,6 +906,8 @@ async def send_max_reminder(phone: str, text: str, bot=None) -> bool:
 
     norm_phone = normalize_phone_e164(phone)
     if not norm_phone:
+        _telemetry["sent_failed"] = int(_telemetry["sent_failed"]) + 1
+        _record_error_msg("Некорректный номер телефона")
         logger.warning("MAX: некорректный номер телефона '%s', отправка пропущена", phone)
         return False
 
@@ -507,14 +919,22 @@ async def send_max_reminder(phone: str, text: str, bot=None) -> bool:
             await _wait_anti_spam_slot()
             if backend == "playwright":
                 sent = await _send_via_playwright(norm_phone, str(text), bot=bot)
+                if not sent and not _telemetry["last_error"]:
+                    _telemetry["sent_failed"] = int(_telemetry["sent_failed"]) + 1
+                    _record_error_msg("Ошибка отправки через Playwright")
             else:
                 sent = await _send_via_ws(norm_phone, str(text), bot=bot)
             if sent:
                 _last_send_monotonic = time.monotonic()
+                _telemetry["sent_ok"] = int(_telemetry["sent_ok"]) + 1
+                _telemetry["last_sent_at"] = db.now_msk().isoformat(timespec="seconds")
+                _telemetry["last_error"] = None
             return bool(sent)
         except MaxSessionExpiredError:
             await _handle_expired_session(bot)
             return False
         except Exception as e:
+            _telemetry["sent_failed"] = int(_telemetry["sent_failed"]) + 1
+            _record_error_msg(f"{type(e).__name__}: {e}")
             logger.warning("MAX: неожиданная ошибка при отправке ***%s: %s", norm_phone[-4:], e)
             return False

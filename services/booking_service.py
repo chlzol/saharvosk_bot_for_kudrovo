@@ -20,16 +20,24 @@ except ImportError:
 
 
 def reload_booking_data():
-    global RAW_BRANCHES, CATEGORIES, SERVICES, MASTERS
-    try:
-        from services import booking_data as bd_mod
-        importlib.reload(bd_mod)
-        RAW_BRANCHES = bd_mod.BRANCHES
-        CATEGORIES = bd_mod.CATEGORIES
-        SERVICES = bd_mod.SERVICES
-        MASTERS = bd_mod.MASTERS
-    except Exception:
-        pass
+    importlib.invalidate_caches()
+    from services import booking_data as bd_mod
+    importlib.reload(bd_mod)
+
+    new_branches = getattr(bd_mod, "BRANCHES", {}) or {}
+    new_categories = getattr(bd_mod, "CATEGORIES", {}) or {}
+    new_services = getattr(bd_mod, "SERVICES", {}) or {}
+    new_masters = getattr(bd_mod, "MASTERS", {}) or {}
+
+    # Обновляем словари на месте, чтобы даже прямые ссылки на SERVICES/MASTERS/CATEGORIES видели новый каталог
+    for target_dict, source_dict in (
+        (RAW_BRANCHES, new_branches),
+        (CATEGORIES, new_categories),
+        (SERVICES, new_services),
+        (MASTERS, new_masters),
+    ):
+        target_dict.clear()
+        target_dict.update(source_dict)
 
 
 BASE_TIME_SLOTS = ["10:00", "11:30", "13:00", "14:30", "16:00", "17:30", "19:00", "20:30"]
@@ -1048,7 +1056,9 @@ def get_masters(branch_id: str, service_ids: str | list[str] | None = None) -> l
 
 def can_combine_services(branch_id: str, current_service_ids: list[str], new_service_id: str) -> tuple[bool, str | None]:
     new_srv = get_service_by_id(new_service_id)
-    if new_srv and not _service_in_branch(new_srv, branch_id):
+    if not new_srv:
+        return False, "⚠️ Выбранная услуга больше не представлена в актуальном каталоге."
+    if not _service_in_branch(new_srv, branch_id):
         return False, "⚠️ Выбранная услуга недоступна в данной студии."
 
     if not current_service_ids:

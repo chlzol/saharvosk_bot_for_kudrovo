@@ -767,7 +767,8 @@ async def _migrate_appointments_nullable_telegram_id(db: aiosqlite.Connection) -
         "id", "telegram_id", "client_name", "phone", "client_phone",
         "branch_id", "branch_title", "cat_id", "service_id", "service_title",
         "price", "duration", "master_id", "master_name", "visit_date",
-        "visit_time", "status", "confirmed", "yclients_record_id", "created_at",
+        "visit_time", "status", "confirmed", "rem_24h_sent", "rem_1h_sent",
+        "yclients_record_id", "created_at",
     ]
     copy_cols = [c for c in target_cols if c in existing_col_names]
     cols_sql = ", ".join(copy_cols)
@@ -796,6 +797,8 @@ async def _migrate_appointments_nullable_telegram_id(db: aiosqlite.Connection) -
                 visit_time TEXT,
                 status TEXT DEFAULT 'active',
                 confirmed INTEGER DEFAULT 0,
+                rem_24h_sent INTEGER DEFAULT 0,
+                rem_1h_sent INTEGER DEFAULT 0,
                 yclients_record_id TEXT,
                 created_at TEXT
             )
@@ -860,6 +863,8 @@ async def init_db():
                 visit_time TEXT,
                 status TEXT DEFAULT 'active',
                 confirmed INTEGER DEFAULT 0,
+                rem_24h_sent INTEGER DEFAULT 0,
+                rem_1h_sent INTEGER DEFAULT 0,
                 yclients_record_id TEXT,
                 created_at TEXT
             )
@@ -881,6 +886,14 @@ async def init_db():
         except Exception:
             pass
         await _migrate_appointments_nullable_telegram_id(db)
+        try:
+            await db.execute("ALTER TABLE appointments ADD COLUMN rem_24h_sent INTEGER DEFAULT 0;")
+        except Exception:
+            pass
+        try:
+            await db.execute("ALTER TABLE appointments ADD COLUMN rem_1h_sent INTEGER DEFAULT 0;")
+        except Exception:
+            pass
         try:
             await db.execute("CREATE INDEX IF NOT EXISTS idx_appointments_yclients_record_id ON appointments(yclients_record_id);")
         except Exception:
@@ -907,6 +920,22 @@ async def init_db():
                 SET visit_time = substr('0' || visit_time, -5)
                 WHERE length(visit_time) = 4 AND visit_time LIKE '_:__';
             """)
+        except Exception:
+            pass
+        try:
+            cur = await db.execute("""
+                SELECT id, phone FROM appointments
+                WHERE (client_phone IS NULL OR client_phone = '')
+                  AND phone IS NOT NULL AND phone != ''
+            """)
+            missing_cp_rows = await cur.fetchall()
+            for row_id, raw_phone in missing_cp_rows:
+                norm_cp = normalize_client_phone(raw_phone)
+                if norm_cp:
+                    await db.execute(
+                        "UPDATE appointments SET client_phone = ? WHERE id = ?",
+                        (norm_cp, row_id)
+                    )
         except Exception:
             pass
 
@@ -1387,7 +1416,16 @@ async def render_step(
             err_lower = str(e).lower()
             if "message is not modified" in err_lower:
                 return
-            if "message can't be edited" in err_lower or "message to edit not found" in err_lower:
+            if (
+                "message can't be edited" in err_lower
+                or "message to edit not found" in err_lower
+                or "there is no text" in err_lower
+            ):
+                if "there is no text" in err_lower:
+                    try:
+                        await msg.delete()
+                    except Exception:
+                        pass
                 try:
                     await msg.answer(text=msg_text, reply_markup=reply_markup, parse_mode="Markdown", disable_web_page_preview=True)
                     return
@@ -1531,12 +1569,19 @@ async def reschedule_and_create_appointment(old_app_id: int | None, telegram_id:
         tg_id_int = None
 
     async with _connect() as db:
-        if old_app_id and tg_id_int:
-            await db.execute("""
-                UPDATE appointments
-                SET status = 'rescheduled'
-                WHERE id = ? AND telegram_id = ? AND status = 'active'
-            """, (old_app_id, tg_id_int))
+        if old_app_id:
+            if tg_id_int:
+                await db.execute("""
+                    UPDATE appointments
+                    SET status = 'rescheduled'
+                    WHERE id = ? AND telegram_id = ? AND status = 'active'
+                """, (old_app_id, tg_id_int))
+            else:
+                await db.execute("""
+                    UPDATE appointments
+                    SET status = 'rescheduled'
+                    WHERE id = ? AND telegram_id IS NULL AND status = 'active'
+                """, (old_app_id,))
 
         cursor = await db.execute("""
             INSERT INTO appointments (
@@ -1678,6 +1723,21 @@ async def admin_cancel_appointment(appointment_id: int) -> dict | None:
         await db.execute("UPDATE appointments SET status = 'cancelled' WHERE id = ?", (appointment_id,))
         await db.commit()
     return app
+
+
+async def claim_appointment_reminder(appointment_id: int, kind: str) -> bool:
+    """Атомарно фиксирует отправку напоминания ('24h' или '1h') для активной записи."""
+    col = "rem_24h_sent" if kind == "24h" else ("rem_1h_sent" if kind == "1h" else None)
+    if not col:
+        raise ValueError(f"Unsupported reminder kind: {kind}")
+    async with _connect() as db:
+        cursor = await db.execute(f"""
+            UPDATE appointments
+            SET {col} = 1
+            WHERE id = ? AND status = 'active' AND COALESCE({col}, 0) = 0
+        """, (appointment_id,))
+        await db.commit()
+        return cursor.rowcount > 0
 
 
 async def get_repeat_days(cat_id: str) -> int:

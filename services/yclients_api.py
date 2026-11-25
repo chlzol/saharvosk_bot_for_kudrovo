@@ -13,6 +13,18 @@ BASE_URL = "https://api.yclients.ru/api/v1"
 MSK_TZ = timezone(timedelta(hours=3))
 
 _http_session: aiohttp.ClientSession | None = None
+_session_locks: dict[int, asyncio.Lock] = {}
+
+
+def _get_session_lock() -> asyncio.Lock:
+    loop = asyncio.get_running_loop()
+    loop_id = id(loop)
+    lock = _session_locks.get(loop_id)
+    if lock is None:
+        _session_locks.clear()
+        lock = asyncio.Lock()
+        _session_locks[loop_id] = lock
+    return lock
 
 
 def now_msk() -> datetime:
@@ -23,31 +35,36 @@ def now_msk() -> datetime:
 async def get_http_session() -> aiohttp.ClientSession:
     global _http_session
     loop = asyncio.get_running_loop()
-    if (
-        _http_session is None
-        or _http_session.closed
-        or getattr(_http_session, "_loop", None) != loop
-        or _http_session._loop.is_closed()
-    ):
-        if _http_session and not _http_session.closed:
-            try:
-                await _http_session.close()
-            except Exception:
-                pass
-        timeout = aiohttp.ClientTimeout(total=12)
-        connector = aiohttp.TCPConnector(limit=100, ttl_dns_cache=300)
-        _http_session = aiohttp.ClientSession(timeout=timeout, connector=connector)
-    return _http_session
+    lock = _get_session_lock()
+    async with lock:
+        if (
+            _http_session is None
+            or _http_session.closed
+            or getattr(_http_session, "_loop", None) != loop
+            or _http_session._loop.is_closed()
+        ):
+            old_sess = _http_session
+            _http_session = None
+            if old_sess and not old_sess.closed:
+                try:
+                    await asyncio.wait_for(old_sess.close(), timeout=2.0)
+                except Exception:
+                    pass
+            timeout = aiohttp.ClientTimeout(total=12)
+            connector = aiohttp.TCPConnector(limit=100, ttl_dns_cache=300)
+            _http_session = aiohttp.ClientSession(timeout=timeout, connector=connector)
+        return _http_session
 
 
 async def close_http_session():
     global _http_session
-    if _http_session and not _http_session.closed:
+    sess = _http_session
+    _http_session = None
+    if sess and not sess.closed:
         try:
-            await _http_session.close()
+            await asyncio.wait_for(sess.close(), timeout=3.0)
         except Exception:
             pass
-    _http_session = None
 
 
 def _get_headers() -> dict:
@@ -78,6 +95,67 @@ def _to_int_service_ids(srv_list: list[str]) -> list[int]:
     return [int(sid) for sid in srv_list if str(sid).strip().isdigit()]
 
 
+_TRANSIENT_HTTP_STATUSES = (429, 500, 502, 503, 504)
+
+
+async def _parse_json_safe(resp) -> tuple[bool, dict | list | None]:
+    try:
+        data = await resp.json()
+        return True, data
+    except Exception:
+        return False, None
+
+
+async def _get_with_retry(
+    url: str,
+    *,
+    params=None,
+    ok_statuses: tuple[int, ...] = (200,),
+    max_attempts: int = 2,
+) -> tuple[int | None, bool, dict | list | None, str]:
+    """
+    Выполняет идемпотентный GET-запрос с 1 коротким повтором при 429/5xx/сетевых обрывах.
+    Возвращает (status_code, is_valid_json, parsed_json, raw_text).
+    """
+    last_err: Exception | None = None
+    for attempt in range(max_attempts):
+        try:
+            session = await get_http_session()
+            req_ctx = session.get(url, headers=_get_headers(), params=params) if params is not None else session.get(url, headers=_get_headers())
+            async with req_ctx as resp:
+                status = resp.status
+                if status in ok_statuses:
+                    is_json, parsed = await _parse_json_safe(resp)
+                    if not is_json:
+                        try:
+                            raw = (await resp.text())[:200]
+                        except Exception:
+                            raw = ""
+                        return status, False, None, raw
+                    return status, True, parsed, ""
+                if status in _TRANSIENT_HTTP_STATUSES and attempt + 1 < max_attempts:
+                    await asyncio.sleep(0.15)
+                    continue
+                if status in _TRANSIENT_HTTP_STATUSES:
+                    return status, False, None, ""
+                try:
+                    raw = (await resp.text())[:300]
+                except Exception:
+                    raw = ""
+                return status, False, None, raw
+        except (aiohttp.ClientError, asyncio.TimeoutError, TimeoutError, OSError) as e:
+            last_err = e
+            if attempt + 1 < max_attempts:
+                await asyncio.sleep(0.15)
+                continue
+        except Exception as e:
+            last_err = e
+            break
+    if last_err is not None:
+        raise last_err
+    return None, False, None, ""
+
+
 async def fetch_masters_for_services(branch_id: str, service_ids: str | list[str]) -> list[dict] | None:
     if not USE_YCLIENTS_API:
         return None
@@ -91,35 +169,33 @@ async def fetch_masters_for_services(branch_id: str, service_ids: str | list[str
     params = [("service_ids[]", sid) for sid in srv_list]
 
     try:
-        session = await get_http_session()
-        async with session.get(url, headers=_get_headers(), params=params) as resp:
-            if resp.status == 200:
-                try:
-                    resp_json = await resp.json()
-                except Exception:
-                    resp_json = {}
-                if isinstance(resp_json, dict) and resp_json.get("success") is False:
-                    logging.warning(f"YCLIENTS book_staff вернул success=False: {resp_json}")
-                    return None
-                staff_list = resp_json if isinstance(resp_json, list) else resp_json.get("data", [])
-                result = []
-                for st in staff_list:
-                    if not isinstance(st, dict):
-                        continue
-                    if not st.get("bookable", True) or st.get("fired") or st.get("is_deleted"):
-                        continue
-                    result.append({
-                        "id": str(st["id"]),
-                        "name": st.get("name", "Специалист"),
-                        "specialization": st.get("specialization", "")
-                    })
-                return result
-            elif resp.status == 429:
-                logging.warning(f"YCLIENTS book_staff: 429 Too Many Requests (company={company_id})")
-            elif resp.status in (500, 502, 503, 504):
-                logging.warning(f"YCLIENTS book_staff: {resp.status} Server Error (company={company_id})")
-            else:
-                logging.warning(f"YCLIENTS book_staff ({resp.status}): {await resp.text()}")
+        status, is_json, resp_json, raw_text = await _get_with_retry(url, params=params)
+        if status == 200:
+            if not is_json or resp_json is None:
+                logging.warning(f"YCLIENTS book_staff вернул некорректный не-JSON ответ: {raw_text}")
+                return None
+            if isinstance(resp_json, dict) and resp_json.get("success") is False:
+                logging.warning(f"YCLIENTS book_staff вернул success=False: {resp_json}")
+                return None
+            staff_list = resp_json if isinstance(resp_json, list) else (resp_json.get("data", []) if isinstance(resp_json, dict) else [])
+            result = []
+            for st in (staff_list or []):
+                if not isinstance(st, dict):
+                    continue
+                if not st.get("bookable", True) or st.get("fired") or st.get("is_deleted"):
+                    continue
+                result.append({
+                    "id": str(st["id"]),
+                    "name": st.get("name", "Специалист"),
+                    "specialization": st.get("specialization", "")
+                })
+            return result
+        elif status == 429:
+            logging.warning(f"YCLIENTS book_staff: 429 Too Many Requests (company={company_id})")
+        elif status in (500, 502, 503, 504):
+            logging.warning(f"YCLIENTS book_staff: {status} Server Error (company={company_id})")
+        else:
+            logging.warning(f"YCLIENTS book_staff ({status}): {raw_text}")
     except Exception as e:
         logging.error(f"Ошибка получения мастеров для услуг {srv_list}: {e}")
 
@@ -142,25 +218,23 @@ async def fetch_available_dates(branch_id: str, master_id: str, service_ids: str
         params.append(("staff_id", str(staff_int)))
 
     try:
-        session = await get_http_session()
-        async with session.get(url, headers=_get_headers(), params=params) as resp:
-            if resp.status == 200:
-                try:
-                    resp_json = await resp.json()
-                except Exception:
-                    resp_json = {}
-                if isinstance(resp_json, dict) and resp_json.get("success") is False:
-                    logging.warning(f"YCLIENTS book_dates вернул success=False: {resp_json}")
-                    return None
-                data = resp_json.get("data", resp_json) if isinstance(resp_json, dict) else {}
-                booking_dates = data.get("booking_dates", [])
-                return [str(d) for d in booking_dates]
-            elif resp.status == 429:
-                logging.warning(f"YCLIENTS book_dates: 429 Too Many Requests (company={company_id})")
-            elif resp.status in (500, 502, 503, 504):
-                logging.warning(f"YCLIENTS book_dates: {resp.status} Server Error (company={company_id})")
-            else:
-                logging.warning(f"YCLIENTS book_dates ({resp.status}): {await resp.text()}")
+        status, is_json, resp_json, raw_text = await _get_with_retry(url, params=params)
+        if status == 200:
+            if not is_json or resp_json is None:
+                logging.warning(f"YCLIENTS book_dates вернул некорректный не-JSON ответ: {raw_text}")
+                return None
+            if isinstance(resp_json, dict) and resp_json.get("success") is False:
+                logging.warning(f"YCLIENTS book_dates вернул success=False: {resp_json}")
+                return None
+            data = resp_json.get("data", resp_json) if isinstance(resp_json, dict) else {}
+            booking_dates = data.get("booking_dates", []) if isinstance(data, dict) else []
+            return [str(d) for d in booking_dates]
+        elif status == 429:
+            logging.warning(f"YCLIENTS book_dates: 429 Too Many Requests (company={company_id})")
+        elif status in (500, 502, 503, 504):
+            logging.warning(f"YCLIENTS book_dates: {status} Server Error (company={company_id})")
+        else:
+            logging.warning(f"YCLIENTS book_dates ({status}): {raw_text}")
     except Exception as e:
         logging.error(f"Сетевая ошибка при запросе рабочих дат YCLIENTS: {e}")
 
@@ -187,46 +261,44 @@ async def _fetch_available_times_raw(
     params = [("service_ids[]", sid) for sid in srv_list if str(sid).strip().isdigit()]
 
     try:
-        session = await get_http_session()
-        async with session.get(url, headers=_get_headers(), params=params) as resp:
-            if resp.status == 200:
-                try:
-                    data = await resp.json()
-                except Exception:
-                    data = {}
-                if isinstance(data, dict) and data.get("success") is False:
-                    logging.warning(f"YCLIENTS book_times вернул success=False: {data}")
-                    return None
-                raw_slots = data if isinstance(data, list) else data.get("data", [])
+        status, is_json, data, raw_text = await _get_with_retry(url, params=params)
+        if status == 200:
+            if not is_json or data is None:
+                logging.warning(f"YCLIENTS book_times вернул некорректный не-JSON ответ: {raw_text}")
+                return None
+            if isinstance(data, dict) and data.get("success") is False:
+                logging.warning(f"YCLIENTS book_times вернул success=False: {data}")
+                return None
+            raw_slots = data if isinstance(data, list) else (data.get("data", []) if isinstance(data, dict) else [])
 
-                slots = []
-                for item in (raw_slots or []):
-                    t = item.get("time") if isinstance(item, dict) else str(item)
-                    if t and ":" in t:
-                        parts = t.split(":")[:2]
-                        if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
-                            slots.append(f"{int(parts[0]):02d}:{int(parts[1]):02d}")
+            slots = []
+            for item in (raw_slots or []):
+                t = item.get("time") if isinstance(item, dict) else str(item)
+                if t and ":" in t:
+                    parts = t.split(":")[:2]
+                    if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+                        slots.append(f"{int(parts[0]):02d}:{int(parts[1]):02d}")
 
-                now = now_msk()
-                target_date = date.fromisoformat(date_str)
-                if target_date < now.date():
-                    return []
-                if target_date == now.date():
-                    min_dt = now + timedelta(minutes=30)
-                    filtered = []
-                    for s in slots:
-                        h, m = map(int, s.split(":"))
-                        if datetime(now.year, now.month, now.day, h, m) >= min_dt:
-                            filtered.append(s)
-                    return filtered
+            now = now_msk()
+            target_date = date.fromisoformat(date_str)
+            if target_date < now.date():
+                return []
+            if target_date == now.date():
+                min_dt = now + timedelta(minutes=30)
+                filtered = []
+                for s in slots:
+                    h, m = map(int, s.split(":"))
+                    if datetime(now.year, now.month, now.day, h, m) >= min_dt:
+                        filtered.append(s)
+                return filtered
 
-                return slots
-            elif resp.status == 429:
-                logging.warning(f"YCLIENTS book_times: 429 Too Many Requests (company={company_id})")
-            elif resp.status in (500, 502, 503, 504):
-                logging.warning(f"YCLIENTS book_times: {resp.status} Server Error (company={company_id})")
-            else:
-                logging.warning(f"YCLIENTS слоты ({resp.status}): {await resp.text()}")
+            return slots
+        elif status == 429:
+            logging.warning(f"YCLIENTS book_times: 429 Too Many Requests (company={company_id})")
+        elif status in (500, 502, 503, 504):
+            logging.warning(f"YCLIENTS book_times: {status} Server Error (company={company_id})")
+        else:
+            logging.warning(f"YCLIENTS слоты ({status}): {raw_text}")
     except Exception as e:
         logging.error(f"Сетевая ошибка при запросе слотов YCLIENTS: {e}")
 
@@ -318,27 +390,27 @@ async def is_yclients_record_active(branch_id: str, yclients_record_id: str | No
 
     url = f"{BASE_URL}/record/{company_id}/{yclients_record_id}"
     try:
-        session = await get_http_session()
-        async with session.get(url, headers=_get_headers()) as resp:
-            if resp.status == 404:
+        status, is_json, resp_json, raw_text = await _get_with_retry(url, ok_statuses=(200, 201))
+        if status == 404:
+            return False
+        if status == 429:
+            logging.warning(f"YCLIENTS 429 при проверке записи #{yclients_record_id}")
+            return True
+        if status in (500, 502, 503, 504):
+            logging.warning(f"YCLIENTS {status} при проверке записи #{yclients_record_id}")
+            return True
+        if status in (200, 201):
+            if not is_json or not isinstance(resp_json, dict):
+                logging.warning(f"YCLIENTS record #{yclients_record_id}: некорректный не-JSON ответ: {raw_text}")
+                return True
+            data = resp_json.get("data") or {}
+            if not isinstance(data, dict):
+                return True
+            if data.get("deleted") is True:
                 return False
-            if resp.status == 429:
-                logging.warning(f"YCLIENTS 429 при проверке записи #{yclients_record_id}")
-                return True
-            if resp.status in (500, 502, 503, 504):
-                logging.warning(f"YCLIENTS {resp.status} при проверке записи #{yclients_record_id}")
-                return True
-            if resp.status in (200, 201):
-                try:
-                    resp_json = await resp.json()
-                except Exception:
-                    resp_json = {}
-                data = (resp_json.get("data") or {}) if isinstance(resp_json, dict) else {}
-                if data.get("deleted") is True:
-                    return False
-                if data.get("attendance") == -1 or data.get("visit_attendance") == -1:
-                    return False
-                return True
+            if data.get("attendance") == -1 or data.get("visit_attendance") == -1:
+                return False
+            return True
     except Exception as e:
         logging.error(f"Ошибка проверки статуса записи #{yclients_record_id} в YCLIENTS: {e}")
 
@@ -356,14 +428,10 @@ async def fetch_record_assigned_staff_id(branch_id: str, yclients_record_id: str
 
     url = f"{BASE_URL}/record/{company_id}/{yclients_record_id}"
     try:
-        session = await get_http_session()
-        async with session.get(url, headers=_get_headers()) as resp:
-            if resp.status in (200, 201):
-                try:
-                    resp_json = await resp.json()
-                except Exception:
-                    resp_json = {}
-                data = (resp_json.get("data") or {}) if isinstance(resp_json, dict) else {}
+        status, is_json, resp_json, _ = await _get_with_retry(url, ok_statuses=(200, 201))
+        if status in (200, 201) and is_json and isinstance(resp_json, dict):
+            data = resp_json.get("data") or {}
+            if isinstance(data, dict):
                 staff_id = data.get("staff_id") or (data.get("staff", {}) or {}).get("id")
                 if staff_id:
                     return str(staff_id)
@@ -408,24 +476,26 @@ async def create_yclients_record(data: dict) -> tuple[str | None, str | None, st
     try:
         session = await get_http_session()
         async with session.post(url, json=payload, headers=_get_headers()) as resp:
-            try:
-                resp_json = await resp.json()
-            except Exception:
-                resp_json = {}
+            is_json, parsed_json = await _parse_json_safe(resp)
+            resp_json = parsed_json if isinstance(parsed_json, dict) else {}
 
-            if resp.status in (200, 201) and resp_json.get("success"):
-                records = resp_json.get("data", [])
-                if records:
-                    rec_obj = records[0] if isinstance(records, list) else records
-                    raw_rec_id = rec_obj.get("record_id") or rec_obj.get("id") if isinstance(rec_obj, dict) else None
-                    if not raw_rec_id:
-                        return None, "Сервер расписания не вернул номер записи.", None
-                    rec_id = str(raw_rec_id)
-                    assigned_staff = str(rec_obj.get("staff_id")) if rec_obj.get("staff_id") else None
-                    if not assigned_staff and data["master_id"] == "any":
-                        assigned_staff = await fetch_record_assigned_staff_id(data["branch_id"], rec_id)
-                    logging.info(f"Запись #{rec_id} успешно создана в YCLIENTS ({data['branch_id']})")
-                    return rec_id, None, assigned_staff
+            if resp.status in (200, 201):
+                if not is_json:
+                    logging.warning(f"YCLIENTS create_record вернул не-JSON ответ ({resp.status}) ({data['branch_id']})")
+                    return None, "Некорректный ответ сервера расписания. Повторите попытку чуть позже.", None
+                if resp_json.get("success"):
+                    records = resp_json.get("data", [])
+                    if records:
+                        rec_obj = records[0] if isinstance(records, list) else records
+                        raw_rec_id = rec_obj.get("record_id") or rec_obj.get("id") if isinstance(rec_obj, dict) else None
+                        if not raw_rec_id:
+                            return None, "Сервер расписания не вернул номер записи.", None
+                        rec_id = str(raw_rec_id)
+                        assigned_staff = str(rec_obj.get("staff_id")) if rec_obj.get("staff_id") else None
+                        if not assigned_staff and data["master_id"] == "any":
+                            assigned_staff = await fetch_record_assigned_staff_id(data["branch_id"], rec_id)
+                        logging.info(f"Запись #{rec_id} успешно создана в YCLIENTS ({data['branch_id']})")
+                        return rec_id, None, assigned_staff
 
             if resp.status == 429:
                 logging.warning(f"YCLIENTS create_record: 429 Too Many Requests ({data['branch_id']})")
@@ -497,38 +567,38 @@ async def confirm_yclients_record(
 
     # 1. Проверяем актуальность и параметры времени записи в CRM-журнале
     try:
-        session = await get_http_session()
-        async with session.get(url, headers=_get_headers()) as resp:
-            if resp.status == 404:
-                return "cancelled", f"Запись #{yclients_record_id} не найдена в YCLIENTS (404)."
-            if resp.status == 429:
-                logging.warning(f"YCLIENTS confirm: 429 Too Many Requests GET #{yclients_record_id}")
-                return "api_error", "Сервер YCLIENTS временно перегружен (429 Too Many Requests)."
-            if resp.status in (500, 502, 503, 504):
-                logging.warning(f"YCLIENTS GET record #{yclients_record_id} вернул серверную ошибку {resp.status}")
-                return "api_error", f"Серверная ошибка YCLIENTS ({resp.status})"
-            if resp.status in (200, 201):
-                try:
-                    resp_json = await resp.json()
-                except Exception:
-                    resp_json = {}
-                data = (resp_json.get("data") or {}) if isinstance(resp_json, dict) else {}
+        status, is_json, resp_json, raw_text = await _get_with_retry(url, ok_statuses=(200, 201))
+        if status == 404:
+            return "cancelled", f"Запись #{yclients_record_id} не найдена в YCLIENTS (404)."
+        if status == 429:
+            logging.warning(f"YCLIENTS confirm: 429 Too Many Requests GET #{yclients_record_id}")
+            return "api_error", "Сервер YCLIENTS временно перегружен (429 Too Many Requests)."
+        if status in (500, 502, 503, 504):
+            logging.warning(f"YCLIENTS GET record #{yclients_record_id} вернул серверную ошибку {status}")
+            return "api_error", f"Серверная ошибка YCLIENTS ({status})"
+        if status in (200, 201):
+            if not is_json or not isinstance(resp_json, dict):
+                logging.warning(f"YCLIENTS GET record #{yclients_record_id}: некорректный не-JSON ответ: {raw_text}")
+                return "api_error", "Некорректный ответ сервера YCLIENTS (ожидался JSON)."
+            data = resp_json.get("data") or {}
+            if not isinstance(data, dict):
+                data = {}
 
-                # Проверка флага удаления и статуса отмены/неявки
-                if data.get("deleted") is True or data.get("attendance") == -1 or data.get("visit_attendance") == -1:
-                    return "cancelled", f"Запись #{yclients_record_id} удалена или отменена в журнале YCLIENTS."
+            # Проверка флага удаления и статуса отмены/неявки
+            if data.get("deleted") is True or data.get("attendance") == -1 or data.get("visit_attendance") == -1:
+                return "cancelled", f"Запись #{yclients_record_id} удалена или отменена в журнале YCLIENTS."
 
-                # Проверка переноса даты или времени
-                rec_dt = str(data.get("datetime") or "")
-                if expected_date and expected_date not in rec_dt:
-                    return "rescheduled", f"Дата записи #{yclients_record_id} изменена в YCLIENTS ({rec_dt})."
-                if expected_time:
-                    norm_time = expected_time.zfill(5)
-                    if norm_time not in rec_dt and expected_time not in rec_dt:
-                        return "rescheduled", f"Время записи #{yclients_record_id} изменено в YCLIENTS ({rec_dt})."
-            else:
-                logging.warning(f"YCLIENTS GET record #{yclients_record_id} статус {resp.status}")
-                return "api_error", f"Ошибка YCLIENTS ({resp.status})"
+            # Проверка переноса даты или времени
+            rec_dt = str(data.get("datetime") or "")
+            if expected_date and expected_date not in rec_dt:
+                return "rescheduled", f"Дата записи #{yclients_record_id} изменена в YCLIENTS ({rec_dt})."
+            if expected_time:
+                norm_time = expected_time.zfill(5)
+                if norm_time not in rec_dt and expected_time not in rec_dt:
+                    return "rescheduled", f"Время записи #{yclients_record_id} изменено в YCLIENTS ({rec_dt})."
+        else:
+            logging.warning(f"YCLIENTS GET record #{yclients_record_id} статус {status}")
+            return "api_error", f"Ошибка YCLIENTS ({status})"
     except Exception as e:
         logging.error(f"Сетевой сбой при проверке записи #{yclients_record_id} в YCLIENTS: {e}")
         return "api_error", str(e)

@@ -17,6 +17,11 @@ from handlers.admin import (
 from database import db
 
 router = Router()
+_IGNORED_SUPPORT_BUTTONS = MAIN_MENU_BUTTONS | {
+    "❌ Отменить запись",
+    "❌ Завершить диалог с администратором",
+    "🚪 Выйти из диалога",
+}
 
 
 async def ensure_user_consent(message: Message) -> bool:
@@ -191,9 +196,8 @@ async def select_support_branch(call: CallbackQuery, state: FSMContext):
 
 
 @router.message(
-    StateFilter(SupportState.chatting, None),
     F.chat.type == "private",
-    F.text == "❌ Завершить диалог с администратором"
+    F.text.in_({"❌ Завершить диалог с администратором", "🚪 Выйти из диалога"})
 )
 async def exit_client_support(message: Message, state: FSMContext):
     await state.clear()
@@ -256,7 +260,7 @@ async def forward_client_message_to_admins_and_archive(message: Message, branch_
 @router.message(
     SupportState.chatting,
     F.chat.type == "private",
-    F.photo | (F.text & ~F.text.in_(MAIN_MENU_BUTTONS) & ~F.text.startswith("/"))
+    F.photo | (F.text & ~F.text.in_(_IGNORED_SUPPORT_BUTTONS) & ~F.text.startswith("/"))
 )
 async def process_client_support_message(message: Message, state: FSMContext):
     data = await state.get_data()
@@ -265,9 +269,21 @@ async def process_client_support_message(message: Message, state: FSMContext):
 
 
 @router.message(
+    SupportState.chatting,
+    F.chat.type == "private",
+    ~F.photo & ~F.text
+)
+async def process_client_support_unsupported(message: Message):
+    await message.answer(
+        "⚠️ В чате поддержки можно отправлять только **текстовые сообщения** или **фотографии**.",
+        parse_mode="Markdown"
+    )
+
+
+@router.message(
     StateFilter(None),
     F.chat.type == "private",
-    F.photo | (F.text & ~F.text.in_(MAIN_MENU_BUTTONS) & ~F.text.startswith("/"))
+    F.photo | (F.text & ~F.text.in_(_IGNORED_SUPPORT_BUTTONS) & ~F.text.startswith("/"))
 )
 async def process_direct_client_reply(message: Message):
     if not await ensure_user_consent(message):

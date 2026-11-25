@@ -1,9 +1,12 @@
 import os
 from dotenv import load_dotenv
 
-load_dotenv()
-
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+_ENV_PATH = os.path.join(BASE_DIR, ".env")
+if os.path.exists(_ENV_PATH):
+    load_dotenv(_ENV_PATH)
+else:
+    load_dotenv()
 
 
 def _parse_bool(env_name: str, default: bool = False) -> bool:
@@ -46,6 +49,7 @@ ADMIN_IDS: list[int] = _parse_admin_ids(os.getenv("ADMIN_IDS", ""))
 USE_YCLIENTS_API = _parse_bool("USE_YCLIENTS_API", default=False)
 YCLIENTS_PARTNER_TOKEN = os.getenv("YCLIENTS_PARTNER_TOKEN", "").strip()
 YCLIENTS_USER_TOKEN = os.getenv("YCLIENTS_USER_TOKEN", "").strip()
+# Опциональные legacy-поля (для совместимости; маскируются в health_monitor)
 YCLIENTS_LOGIN = os.getenv("YCLIENTS_LOGIN", "").strip()
 YCLIENTS_PASSWORD = os.getenv("YCLIENTS_PASSWORD", "")
 
@@ -57,7 +61,8 @@ YCLIENTS_COMPANIES = {
 # --- Настройки встроенного HTTP-сервера для приёма вебхуков YCLIENTS ---
 YCLIENTS_WEBHOOK_ENABLED = _parse_bool("YCLIENTS_WEBHOOK_ENABLED", default=True)
 YCLIENTS_WEBHOOK_HOST = (os.getenv("YCLIENTS_WEBHOOK_HOST") or "0.0.0.0").strip()
-YCLIENTS_WEBHOOK_PORT = _parse_int("YCLIENTS_WEBHOOK_PORT", 8080)
+_raw_wh_port = _parse_int("YCLIENTS_WEBHOOK_PORT", 8080)
+YCLIENTS_WEBHOOK_PORT = _raw_wh_port if 1 <= _raw_wh_port <= 65535 else 8080
 YCLIENTS_WEBHOOK_SECRET = (os.getenv("YCLIENTS_WEBHOOK_SECRET") or "").strip()
 
 # Обратный маппинг company_id → branch_id для вебхуков

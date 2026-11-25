@@ -14,8 +14,14 @@ def _parse_visit_dt(visit_date: str, visit_time: str) -> datetime:
     parts = raw_time.split(":")
     hour = int(parts[0]) if parts and parts[0].isdigit() else 0
     minute = int(parts[1]) if len(parts) >= 2 and parts[1].isdigit() else 0
+    extra_days, hour = divmod(hour, 24)
+    if minute >= 60:
+        extra_hours, minute = divmod(minute, 60)
+        more_days, hour = divmod(hour + extra_hours, 24)
+        extra_days += more_days
     norm_time = f"{hour:02d}:{minute:02d}"
-    return datetime.fromisoformat(f"{visit_date}T{norm_time}:00").replace(tzinfo=MSK_TZ)
+    base_dt = datetime.fromisoformat(f"{visit_date}T{norm_time}:00").replace(tzinfo=MSK_TZ)
+    return base_dt + timedelta(days=extra_days) if extra_days else base_dt
 
 
 def generate_google_calendar_url(

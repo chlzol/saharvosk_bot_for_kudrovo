@@ -271,7 +271,7 @@ def masters_kb(masters: list[dict], page: int = 1, page_size: int = 6) -> Inline
 
 def calendar_kb(year: int, month: int, api_dates: list[str] | None = None) -> InlineKeyboardMarkup:
     allowed_months = get_allowed_months()
-    if month not in MONTH_NAMES:
+    if (year, month) not in allowed_months or month not in MONTH_NAMES:
         year, month = allowed_months[0]
     available_dates = set(get_available_dates_in_month(year, month, api_dates=api_dates))
 
@@ -480,7 +480,29 @@ def admin_main_kb(unread_count: int = 0) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="⏳ Интервалы повторной записи", callback_data="adm:repeat_settings")],
         [InlineKeyboardButton(text="👥 Администраторы", callback_data="adm:admins")],
         [InlineKeyboardButton(text="🧹 Очистить тестовый кэш", callback_data="adm:clear_cache")],
+        [InlineKeyboardButton(text="🩺 Статус систем", callback_data="adm_health")],
         [InlineKeyboardButton(text="📊 Обновить показатели", callback_data="adm:home")]
+    ])
+
+
+def admin_health_kb(errors_count: int = 0) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🔄 Обновить", callback_data="adm_health:refresh"),
+            InlineKeyboardButton(text="🔌 Пинг MAX", callback_data="adm_health:max_ping"),
+        ],
+        [InlineKeyboardButton(text=f"🚨 Ошибки ({errors_count})", callback_data="adm_health:errors")],
+        [InlineKeyboardButton(text="◀️ В админ-меню", callback_data="adm_back")],
+    ])
+
+
+def admin_health_errors_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🔄 Обновить", callback_data="adm_health:errors"),
+            InlineKeyboardButton(text="🧹 Очистить буфер", callback_data="adm_health:clear_errors"),
+        ],
+        [InlineKeyboardButton(text="◀️ К статусу", callback_data="adm_health")],
     ])
 
 
@@ -617,11 +639,17 @@ def admin_clear_cache_confirm_kb() -> InlineKeyboardMarkup:
     ])
 
 
-def admin_manage_admins_kb(db_admins: list[dict], env_admins: list[int]) -> InlineKeyboardMarkup:
+def admin_manage_admins_kb(
+    db_admins: list[dict],
+    env_admins: list[int],
+    current_admin_id: int | None = None,
+) -> InlineKeyboardMarkup:
+    all_admin_ids = set(env_admins) | {a["telegram_id"] for a in db_admins if a.get("telegram_id")}
     buttons = [[InlineKeyboardButton(text="＋ Добавить администратора", callback_data="adm_mgr:add")]]
     for a in db_admins:
-        if a["telegram_id"] not in env_admins:
-            buttons.append([InlineKeyboardButton(text=f"🗑 Удалить: {a['name']} ({a['telegram_id']})", callback_data=f"adm_mgr:del:{a['telegram_id']}")])
+        tid = a["telegram_id"]
+        if tid not in env_admins and tid != current_admin_id and len(all_admin_ids) > 1:
+            buttons.append([InlineKeyboardButton(text=f"🗑 Удалить: {a['name']} ({tid})", callback_data=f"adm_mgr:del:{tid}")])
     buttons.append([InlineKeyboardButton(text="‹ В панель управления", callback_data="adm:home")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 

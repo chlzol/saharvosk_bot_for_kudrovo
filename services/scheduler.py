@@ -42,6 +42,26 @@ def _has_max_delivery(app: dict | None) -> bool:
     return bool(config.MAX_ENABLED and _get_appointment_phone(app))
 
 
+def _parse_visit_dt(app: dict | None) -> datetime | None:
+    if not app:
+        return None
+    vdate = str(app.get("visit_date") or "").strip()
+    vtime_raw = app.get("visit_time")
+    norm_time = db.normalize_time_str(vtime_raw)
+    if norm_time == "24:00":
+        try:
+            d = date.fromisoformat(vdate) + timedelta(days=1)
+            return datetime(d.year, d.month, d.day, 0, 0, 0)
+        except ValueError:
+            logging.warning(f"Некорректная дата визита #{app.get('id')}: {vdate} {vtime_raw}")
+            return None
+    try:
+        return datetime.fromisoformat(f"{vdate}T{norm_time}:00")
+    except ValueError:
+        logging.warning(f"Некорректная дата/время визита #{app.get('id')}: {vdate} {vtime_raw}")
+        return None
+
+
 def _strip_markdown_for_max(text: str) -> str:
     """Очищает Telegram Markdown-разметку и escape-символы в чистый текст для MAX."""
     if not text:
@@ -140,6 +160,7 @@ async def _is_appointment_still_valid(
     )
     if not yc_active:
         await db.admin_cancel_appointment(app["id"])
+        remove_appointment_reminders(app["id"])
         return False
 
     return True
@@ -154,14 +175,19 @@ async def send_24h_reminder(bot: Bot, appointment_id: int, force: bool = False):
     if not has_tg and not has_max:
         return
 
-    time_parts = str(app["visit_time"]).split(":")
-    norm_time = f"{int(time_parts[0]):02d}:{int(time_parts[1]):02d}"
-    visit_dt = datetime.fromisoformat(f"{app['visit_date']}T{norm_time}:00")
+    visit_dt = _parse_visit_dt(app)
+    if not visit_dt:
+        return
     now = now_msk()
     if not force and now >= visit_dt:
         return
 
+    if not force and not await db.claim_appointment_reminder(appointment_id, "24h"):
+        logging.info(f"24ч напоминание для записи #{appointment_id} уже отправлено — пропуск дубля.")
+        return
+
     formatted_date = date.fromisoformat(app["visit_date"]).strftime("%d.%m.%Y")
+    display_time = db.normalize_time_str(app["visit_time"])
     branch = bs.get_branches().get(app["branch_id"], {})
     address = branch.get("address", app["branch_title"])
     is_confirmed = bool(app.get("confirmed") == 1)
@@ -178,7 +204,7 @@ async def send_24h_reminder(bot: Bot, appointment_id: int, force: bool = False):
                 service_title=app["service_title"],
                 master_name=app["master_name"],
                 formatted_date=formatted_date,
-                visit_time=app["visit_time"],
+                visit_time=display_time,
                 branch_title=app["branch_title"]
             )
         except TelegramForbiddenError as e:
@@ -212,15 +238,20 @@ async def send_1h_reminder(bot: Bot, appointment_id: int, force: bool = False):
     if not has_tg and not has_max:
         return
 
-    time_parts = str(app["visit_time"]).split(":")
-    norm_time = f"{int(time_parts[0]):02d}:{int(time_parts[1]):02d}"
-    visit_dt = datetime.fromisoformat(f"{app['visit_date']}T{norm_time}:00")
+    visit_dt = _parse_visit_dt(app)
+    if not visit_dt:
+        return
     now = now_msk()
     if not force and (now >= visit_dt or (visit_dt - now).total_seconds() < 900):
         logging.info(f"Визит #{appointment_id} уже начался или до него осталось менее 15 мин — 1ч напоминание пропущено.")
         return
 
+    if not force and not await db.claim_appointment_reminder(appointment_id, "1h"):
+        logging.info(f"1ч напоминание для записи #{appointment_id} уже отправлено — пропуск дубля.")
+        return
+
     formatted_date = date.fromisoformat(app["visit_date"]).strftime("%d.%m.%Y")
+    display_time = db.normalize_time_str(app["visit_time"])
     branch = bs.get_branches().get(app["branch_id"], {})
     address = branch.get("address", app["branch_title"])
 
@@ -235,7 +266,7 @@ async def send_1h_reminder(bot: Bot, appointment_id: int, force: bool = False):
                 address=address,
                 service_title=app["service_title"],
                 master_name=app["master_name"],
-                visit_time=app["visit_time"],
+                visit_time=display_time,
                 branch_title=app["branch_title"]
             )
         except TelegramForbiddenError as e:
@@ -336,36 +367,38 @@ async def schedule_appointment_reminders(bot: Bot, appointment_id: int):
     if not app or app["status"] not in ("active", "completed") or (not has_tg and not has_max):
         return
 
-    time_parts = str(app["visit_time"]).split(":")
-    norm_time = f"{int(time_parts[0]):02d}:{int(time_parts[1]):02d}"
-    visit_dt = datetime.fromisoformat(f"{app['visit_date']}T{norm_time}:00")
+    visit_dt = _parse_visit_dt(app)
+    if not visit_dt:
+        return
     now = now_msk()
     duration_min = int(app.get("duration", 30) or 30)
 
     if app["status"] == "active":
-        dt_24h = visit_dt - timedelta(hours=24)
-        if dt_24h > now:
-            scheduler.add_job(
-                send_24h_reminder,
-                trigger="date",
-                run_date=dt_24h,
-                args=[bot, appointment_id],
-                id=f"rem_24h_{appointment_id}",
-                misfire_grace_time=1800,
-                replace_existing=True
-            )
+        if not app.get("rem_24h_sent"):
+            dt_24h = visit_dt - timedelta(hours=24)
+            if dt_24h > now:
+                scheduler.add_job(
+                    send_24h_reminder,
+                    trigger="date",
+                    run_date=dt_24h,
+                    args=[bot, appointment_id],
+                    id=f"rem_24h_{appointment_id}",
+                    misfire_grace_time=1800,
+                    replace_existing=True
+                )
 
-        dt_1h = visit_dt - timedelta(hours=1)
-        if dt_1h > now:
-            scheduler.add_job(
-                send_1h_reminder,
-                trigger="date",
-                run_date=dt_1h,
-                args=[bot, appointment_id],
-                id=f"rem_1h_{appointment_id}",
-                misfire_grace_time=1800,
-                replace_existing=True
-            )
+        if not app.get("rem_1h_sent"):
+            dt_1h = visit_dt - timedelta(hours=1)
+            if dt_1h > now:
+                scheduler.add_job(
+                    send_1h_reminder,
+                    trigger="date",
+                    run_date=dt_1h,
+                    args=[bot, appointment_id],
+                    id=f"rem_1h_{appointment_id}",
+                    misfire_grace_time=1800,
+                    replace_existing=True
+                )
 
     if has_tg:
         dt_after = visit_dt + timedelta(minutes=duration_min)

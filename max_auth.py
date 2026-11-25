@@ -16,10 +16,12 @@ from pathlib import Path
 
 import config
 from services.max_sender import (
+    close_client_safely,
     normalize_phone_e164,
     resolve_playwright_profile_dir,
     resolve_session_location,
     save_auth_meta,
+    _load_auth_meta,
 )
 
 
@@ -61,7 +63,7 @@ async def _auth_ws_qr(work_dir: str, session_name: str) -> None:
             f"\n   Аккаунт: id={getattr(contact, 'id', '?')}, имя={getattr(contact, 'names', '')}"
         )
     finally:
-        await client.close()
+        await asyncio.shield(close_client_safely(client))
 
 
 async def _auth_ws_sms(phone: str, work_dir: str, session_name: str) -> None:
@@ -96,7 +98,7 @@ async def _auth_ws_sms(phone: str, work_dir: str, session_name: str) -> None:
             f"\n   Аккаунт: {norm_phone} (id={getattr(contact, 'id', '?')})"
         )
     finally:
-        await client.close()
+        await asyncio.shield(close_client_safely(client))
 
 
 async def _auth_playwright() -> None:
@@ -133,18 +135,31 @@ async def run_auth(args: argparse.Namespace) -> None:
         return
 
     work_dir, session_name = resolve_session_location()
-    # При повторном запуске max_auth.py по умолчанию очищаем старый файл сессии,
-    # чтобы connect() не пытался логиниться по протухшему токену.
-    if not args.keep_existing:
-        _clear_existing_ws_session(work_dir, session_name)
-
     method = args.method
     if not method:
         print("Выберите способ авторизации MAX:")
         print("  1 — QR-код (WebSocket, рекомендуется — как на web.max.ru)")
         print("  2 — Номер телефона + код из SMS/MAX")
-        choice = input("Ваш выбор [1]: ").strip() or "1"
+        try:
+            choice = input("Ваш выбор [1]: ").strip() or "1"
+        except EOFError:
+            choice = "1"
         method = "sms" if choice == "2" else "qr"
+
+    expected_client_type = "client" if method == "sms" else "web_client"
+    # При повторном запуске по умолчанию очищаем старый файл сессии; при --keep-existing
+    # сбрасываем только если способ входа конфликтует с типом сохранённой сессии (QR vs SMS).
+    if not args.keep_existing:
+        _clear_existing_ws_session(work_dir, session_name)
+    else:
+        meta = _load_auth_meta(work_dir, session_name)
+        saved_type = str((meta or {}).get("client_type") or "").strip().lower()
+        if saved_type and saved_type != expected_client_type:
+            print(
+                f"⚠️ Существующая сессия создана другим способом ({saved_type} != {expected_client_type}) — "
+                "очищаю её для корректной авторизации."
+            )
+            _clear_existing_ws_session(work_dir, session_name)
 
     if method == "sms":
         phone = args.phone or input("Введите номер телефона аккаунта MAX (например, +79991234567): ").strip()

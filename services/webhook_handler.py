@@ -9,6 +9,7 @@
 import asyncio
 import logging
 import re
+import time
 from datetime import datetime, date, timedelta, timezone
 
 import aiosqlite
@@ -29,6 +30,81 @@ MSK_TZ = timezone(timedelta(hours=3))
 # Локи для защиты от гонки по yclients_record_id
 _dedup_locks: dict[str, asyncio.Lock] = {}
 _dedup_waiters: dict[str, int] = {}
+
+# Кэш недавно удалённых/отменённых yclients_record_id (защита от out-of-order delete -> create)
+_recently_deleted_yclients_ids: dict[str, float] = {}
+_DELETE_TOMBSTONE_TTL_SECONDS = 600.0
+_DELETE_TOMBSTONE_MAX_SIZE = 2000
+
+
+def _prune_deleted_tombstones(now_mono: float | None = None) -> None:
+    now_val = time.monotonic() if now_mono is None else now_mono
+    expired = [
+        k for k, ts in _recently_deleted_yclients_ids.items()
+        if (now_val - ts) > _DELETE_TOMBSTONE_TTL_SECONDS
+    ]
+    for k in expired:
+        _recently_deleted_yclients_ids.pop(k, None)
+    if len(_recently_deleted_yclients_ids) >= _DELETE_TOMBSTONE_MAX_SIZE:
+        oldest = sorted(_recently_deleted_yclients_ids.items(), key=lambda item: item[1])
+        for k, _ in oldest[:len(_recently_deleted_yclients_ids) - _DELETE_TOMBSTONE_MAX_SIZE + 1]:
+            _recently_deleted_yclients_ids.pop(k, None)
+
+
+def _mark_recently_deleted(yclients_record_id: str | int | None) -> None:
+    if not yclients_record_id:
+        return
+    now_mono = time.monotonic()
+    _prune_deleted_tombstones(now_mono)
+    _recently_deleted_yclients_ids[str(yclients_record_id)] = now_mono
+
+
+def _is_recently_deleted(yclients_record_id: str | int | None) -> bool:
+    if not yclients_record_id:
+        return False
+    now_mono = time.monotonic()
+    _prune_deleted_tombstones(now_mono)
+    return str(yclients_record_id) in _recently_deleted_yclients_ids
+
+_background_tasks_ref: set[asyncio.Task] | None = None
+_telemetry: dict[str, object] = {
+    "last_webhook_at": None,
+    "last_webhook_event": None,
+    "created": 0,
+    "updated": 0,
+    "deleted": 0,
+    "auth_rejected": 0,
+    "errors": 0,
+}
+
+
+def register_background_tasks_ref(tasks: set[asyncio.Task]) -> None:
+    """Связывает набор фоновых webhook-задач из main.py с телеметрией."""
+    global _background_tasks_ref
+    _background_tasks_ref = tasks
+
+
+def record_webhook_auth_rejected() -> None:
+    _telemetry["auth_rejected"] = int(_telemetry["auth_rejected"]) + 1
+
+
+def record_webhook_error() -> None:
+    _telemetry["errors"] = int(_telemetry["errors"]) + 1
+
+
+def get_webhook_telemetry() -> dict:
+    """Возвращает потокобезопасный снимок телеметрии YCLIENTS-вебхуков."""
+    return {
+        "last_webhook_at": _telemetry["last_webhook_at"],
+        "last_webhook_event": _telemetry["last_webhook_event"],
+        "created": int(_telemetry["created"]),
+        "updated": int(_telemetry["updated"]),
+        "deleted": int(_telemetry["deleted"]),
+        "auth_rejected": int(_telemetry["auth_rejected"]),
+        "errors": int(_telemetry["errors"]),
+        "dedup_locks": len(_dedup_locks),
+        "background_tasks": len(_background_tasks_ref) if _background_tasks_ref is not None else 0,
+    }
 
 
 def normalize_phone(raw: str | None) -> str | None:
@@ -229,6 +305,7 @@ def _extract_record_data(payload: dict) -> dict | None:
     # Длительность: в YCLIENTS seance_length в корне задает общую длительность слота в журнале
     root_dur = _parse_duration(data.get("seance_length") or data.get("length"))
     services_dur = sum(_parse_duration(s.get("seance_length") or s.get("length")) for s in services if isinstance(s, dict))
+    has_explicit_duration = (root_dur > 0) or (services_dur > 0)
     if root_dur > 0:
         total_duration = root_dur
     elif services_dur > 0:
@@ -274,6 +351,7 @@ def _extract_record_data(payload: dict) -> dict | None:
         "has_explicit_services": has_explicit_services,
         "has_explicit_staff": has_explicit_staff,
         "has_explicit_cost": has_explicit_cost,
+        "has_explicit_duration": has_explicit_duration,
         "deleted": deleted,
         "attendance": attendance,
     }
@@ -361,63 +439,74 @@ async def handle_webhook_event(payload: dict, bot: Bot):
     """
     resource = payload.get("resource", "")
     status = payload.get("status", "")
+    _telemetry["last_webhook_at"] = db.now_msk().isoformat(timespec="seconds")
+    _telemetry["last_webhook_event"] = f"{resource or '?'}:{status or 'auto'}"
 
     # Принимаем только события типа "record" / "records"
     if resource not in ("record", "records"):
         logger.info("Webhook: событие с resource='%s' пропущено", resource)
         return
 
-    record_data = _extract_record_data(payload)
-    if not record_data:
-        logger.warning("Webhook: невозможно извлечь корректные данные записи")
-        return
-
-    branch_id = _resolve_branch_id(record_data["company_id"])
-    if not branch_id:
-        logger.info(
-            "Webhook: неизвестный company_id=%s, филиал не относится к Sahar&Vosk Кудрово",
-            record_data["company_id"],
-        )
-        return
-
-    yclients_record_id = record_data["yclients_record_id"]
-
-    # Антидубль и защита от race conditions через per-record блокировку
-    lock_key = f"wh_{yclients_record_id}"
-    lock = _dedup_locks.setdefault(lock_key, asyncio.Lock())
-    _dedup_waiters[lock_key] = _dedup_waiters.get(lock_key, 0) + 1
-
     try:
-        async with lock:
-            if record_data["deleted"] or record_data["attendance"] == -1 or status == "delete":
-                await _handle_delete(record_data, branch_id, bot)
-            elif status == "create":
-                await _handle_create(record_data, branch_id, bot)
-            elif status == "update":
-                await _handle_update(record_data, branch_id, bot)
-            else:
-                existing = await _get_appointment_by_yclients_id(yclients_record_id)
-                if existing:
+        record_data = _extract_record_data(payload)
+        if not record_data:
+            _telemetry["errors"] = int(_telemetry["errors"]) + 1
+            logger.warning("Webhook: невозможно извлечь корректные данные записи")
+            return
+
+        branch_id = _resolve_branch_id(record_data["company_id"])
+        if not branch_id:
+            logger.info(
+                "Webhook: неизвестный company_id=%s, филиал не относится к Sahar&Vosk Кудрово",
+                record_data["company_id"],
+            )
+            return
+
+        yclients_record_id = record_data["yclients_record_id"]
+
+        # Антидубль и защита от race conditions через per-record блокировку
+        lock_key = f"wh_{yclients_record_id}"
+        lock = _dedup_locks.setdefault(lock_key, asyncio.Lock())
+        _dedup_waiters[lock_key] = _dedup_waiters.get(lock_key, 0) + 1
+
+        try:
+            async with lock:
+                if record_data["deleted"] or record_data["attendance"] == -1 or status == "delete":
+                    await _handle_delete(record_data, branch_id, bot)
+                elif status == "create":
+                    await _handle_create(record_data, branch_id, bot)
+                elif status == "update":
                     await _handle_update(record_data, branch_id, bot)
                 else:
-                    await _handle_create(record_data, branch_id, bot)
-    finally:
-        # Корректная очистка лока: удаляем только когда все задачи на этом ключе завершились
-        _dedup_waiters[lock_key] = max(0, _dedup_waiters.get(lock_key, 1) - 1)
-        if _dedup_waiters.get(lock_key, 0) <= 0:
-            _dedup_waiters.pop(lock_key, None)
-            _dedup_locks.pop(lock_key, None)
+                    existing = await _get_appointment_by_yclients_id(yclients_record_id)
+                    if existing:
+                        await _handle_update(record_data, branch_id, bot)
+                    else:
+                        await _handle_create(record_data, branch_id, bot)
+        finally:
+            # Корректная очистка лока: удаляем только когда все задачи на этом ключе завершились
+            _dedup_waiters[lock_key] = max(0, _dedup_waiters.get(lock_key, 1) - 1)
+            if _dedup_waiters.get(lock_key, 0) <= 0:
+                _dedup_waiters.pop(lock_key, None)
+                _dedup_locks.pop(lock_key, None)
+    except Exception:
+        _telemetry["errors"] = int(_telemetry["errors"]) + 1
+        raise
 
 
 async def _handle_create(record_data: dict, branch_id: str, bot: Bot):
     """Обработка события status == 'create'."""
     yclients_record_id = record_data["yclients_record_id"]
 
+    if _is_recently_deleted(yclients_record_id):
+        logger.info("Webhook CREATE: запись #%s недавно отменена/удалена (out-of-order tombstone), пропускаем", yclients_record_id)
+        return
+
     # Задержка 2.5 сек для защиты от гонки с записью, создаваемой самим ботом
     await asyncio.sleep(2.5)
 
-    # 1. Если запись помечена на удаление или клиент не пришёл — игнорируем
-    if record_data["deleted"] or record_data["attendance"] == -1:
+    # 1. Если запись помечена на удаление или клиент не пришёл — игнорируем (плюс повторная проверка tombstone после sleep)
+    if record_data["deleted"] or record_data["attendance"] == -1 or _is_recently_deleted(yclients_record_id):
         logger.info("Webhook CREATE: запись #%s отменена/удалена, игнорируем", yclients_record_id)
         return
 
@@ -434,6 +523,20 @@ async def _handle_create(record_data: dict, branch_id: str, bot: Bot):
     # 3. Проверяем, есть ли уже запись по yclients_record_id
     existing = await _get_appointment_by_yclients_id(yclients_record_id)
     if existing:
+        if existing.get("status") == "active" and not existing.get("telegram_id"):
+            lookup_phone = normalize_phone(record_data.get("client_phone") or existing.get("client_phone") or existing.get("phone"))
+            attach_user = await find_user_by_phone(lookup_phone) if lookup_phone else None
+            if attach_user:
+                async with db._connect() as conn:
+                    await conn.execute(
+                        "UPDATE appointments SET telegram_id = ? WHERE id = ?",
+                        (attach_user["telegram_id"], existing["id"]),
+                    )
+                    await conn.commit()
+                try:
+                    await schedule_appointment_reminders(bot, existing["id"])
+                except Exception as e:
+                    logger.error("Webhook CREATE: ошибка обновления напоминаний при привязке #%s: %s", existing["id"], e)
         logger.info(
             "Webhook CREATE: запись yclients_record_id=%s уже существует в БД (#%s), дедупликация",
             yclients_record_id,
@@ -504,6 +607,7 @@ async def _handle_create(record_data: dict, branch_id: str, bot: Bot):
             "yclients_record_id": yclients_record_id,
         }
         appointment_id = await db.create_appointment(max_app_data)
+        _telemetry["created"] = int(_telemetry["created"]) + 1
         logger.info(
             "Webhook CREATE (MAX): сохранена запись #%s (YCLIENTS #%s) без Telegram для ***%s",
             appointment_id,
@@ -575,6 +679,7 @@ async def _handle_create(record_data: dict, branch_id: str, bot: Bot):
         "yclients_record_id": yclients_record_id,
     }
     appointment_id = await db.create_appointment(app_data)
+    _telemetry["created"] = int(_telemetry["created"]) + 1
     logger.info(
         "Webhook CREATE: сохранена внешняя запись #%s (YCLIENTS #%s) для user=%s",
         appointment_id,
@@ -698,7 +803,7 @@ async def _handle_update(record_data: dict, branch_id: str, bot: Bot):
         and record_data["services_list"] != "Услуга из CRM"
     )
     price_changed = record_data["has_explicit_cost"] and record_data["total_price"] != existing.get("price", 0)
-    duration_changed = bool(record_data["total_duration"]) and record_data["total_duration"] != existing.get("duration", 30)
+    duration_changed = record_data.get("has_explicit_duration", False) and record_data["total_duration"] != existing.get("duration", 30)
 
     # Если ничего не поменялось
     if not (
@@ -775,6 +880,9 @@ async def _handle_update(record_data: dict, branch_id: str, bot: Bot):
         update_fields["visit_date"] = record_data["visit_date"]
     if time_changed:
         update_fields["visit_time"] = norm_rec_time
+    if date_changed or time_changed or phone_changed:
+        update_fields["rem_24h_sent"] = 0
+        update_fields["rem_1h_sent"] = 0
     if master_changed:
         update_fields["master_name"] = record_data["master_name"]
         update_fields["master_id"] = record_data["master_id"]
@@ -797,6 +905,7 @@ async def _handle_update(record_data: dict, branch_id: str, bot: Bot):
         await conn.commit()
 
     logger.info("Webhook UPDATE: запись #%s обновлена: %s", existing["id"], list(update_fields.keys()))
+    _telemetry["updated"] = int(_telemetry["updated"]) + 1
 
     # Если изменились дата, время или канал доставки — пересоздаём таймеры напоминаний
     has_tg = bool(existing.get("telegram_id") and int(existing["telegram_id"]) > 0)
@@ -867,11 +976,12 @@ async def _handle_delete(record_data: dict, branch_id: str, bot: Bot):
 
     existing = await _get_appointment_by_yclients_id(yclients_record_id)
     if not existing:
-        logger.info("Webhook DELETE: запись yclients_id=%s не найдена в БД, пропускаем", yclients_record_id)
+        _mark_recently_deleted(yclients_record_id)
+        logger.info("Webhook DELETE: запись yclients_id=%s не найдена в БД, запоминаем tombstone и пропускаем", yclients_record_id)
         return
 
-    # Защита от эхо-петель: если клиент сам отменил или перенёс через бота
-    if existing["status"] in ("cancelled", "rescheduled"):
+    # Защита от эхо-петель и неактуальной отмены завершённого визита
+    if existing["status"] in ("cancelled", "rescheduled", "completed"):
         logger.info(
             "Webhook DELETE: запись #%s уже имеет статус '%s', пропускаем повторное уведомление",
             existing["id"],
@@ -886,6 +996,7 @@ async def _handle_delete(record_data: dict, branch_id: str, bot: Bot):
 
     # Снимаем все напоминания в планировщике
     remove_appointment_reminders(existing["id"])
+    _telemetry["deleted"] = int(_telemetry["deleted"]) + 1
     logger.info("Webhook DELETE: запись #%s успешно отменена", existing["id"])
 
     # Уведомляем гостя

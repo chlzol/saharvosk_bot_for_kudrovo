@@ -10,6 +10,9 @@ WorkingDirectory=/opt/saharvosk_bot_for_kudrovo
 ExecStart=/opt/saharvosk_bot_for_kudrovo/.venv/bin/python main.py
 Restart=always
 RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=30
+UMask=0077
 Environment=TZ=Europe/Moscow
 Environment=PYTHONUNBUFFERED=1
 StandardOutput=journal

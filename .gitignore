@@ -1,5 +1,7 @@
 # Секретные токены и конфигурация
 .env
+.env.local
+.env.*.local
 
 # Виртуальное окружение
 .venv/
@@ -10,15 +12,17 @@ env/
 *.db
 *.db-wal
 *.db-shm
+*.db-journal
 *.sqlite3
 
 # Бэкапы базы данных на сервере
 backups/
 
-# Кэш Python
+# Кэш и временные артефакты Python
 __pycache__/
 *.py[cod]
 *$py.class
+.booking_data_*.py.tmp
 
 # Настройки IDE (PyCharm / VS Code)
 .idea/
